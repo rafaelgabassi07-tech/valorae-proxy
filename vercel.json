@@ -1,4 +1,5 @@
 {
+  "outputDirectory": "api",
   "cleanUrls": true,
   "rewrites": [
     {
