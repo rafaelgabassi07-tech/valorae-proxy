@@ -4,11 +4,17 @@
   "description": "Proxy serverless para scraping B3 (Investidor10 / StatusInvest) via Vercel",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsx watch api/asset.ts"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "zod": "^3.23.0"
+    "zod": "^3.23.0",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0"
   }
 }
-
