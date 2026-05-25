@@ -1,11 +1,10 @@
 {
-  "name": "meu-proxy",
+  "name": "nexus-proxy",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
+  "engines": { "node": ">=20.0.0" },
   "dependencies": {
     "zod": "^3.23.0"
-  },
-  "engines": {
-    "node": ">=20.x"
   }
 }
