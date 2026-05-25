@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/api/scrape", "destination": "/api/scrape.js" },
+    { "source": "/api/asset", "destination": "/api/asset.js" },
+    { "source": "/api/engine", "destination": "/api/engine.js" }
+  ]
+}
