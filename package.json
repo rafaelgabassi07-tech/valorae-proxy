@@ -1,10 +1,14 @@
 {
   "name": "nexus-proxy",
   "version": "1.0.0",
+  "description": "Proxy serverless para scraping B3 (Investidor10 / StatusInvest) via Vercel",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20.0.0" },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "zod": "^3.23.0"
   }
 }
+
