@@ -357,5 +357,4 @@ export class NexusEngineUltra {
       },
     };
   }
-                  }
-    
+    }
