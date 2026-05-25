@@ -11,7 +11,8 @@
     "esModuleInterop": true,
     "declaration": false,
     "removeComments": false,
-    "noEmitOnError": false
+    "noEmitOnError": false,
+    "types": ["node"]
   },
   "include": ["api/lib/**/*.ts"],
   "exclude": ["node_modules"]
