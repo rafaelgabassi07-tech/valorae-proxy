@@ -1,7 +1,7 @@
 {
   "name": "valorae-proxy",
-  "version": "19.3.0",
-  "description": "Servidor proxy Valorae para scraping público de ações e FIIs com Valorae-engine e ValoraeScrape próprio.",
+  "version": "19.4.0",
+  "description": "Servidor proxy Valorae para scraping público de ações e FIIs com Valorae-engine e ValoraeScrape próprio. Vercel auto-detect functions.",
   "private": true,
   "type": "module",
   "scripts": {
