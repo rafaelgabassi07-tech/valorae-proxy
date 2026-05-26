@@ -1,4 +1,4 @@
-import { ValoraeEngine, canonicalizeTicker, validarTicker } from './_lib/Valorae-engine.js';
+import { ValoraeEngine, canonicalizeTicker, validarTicker } from './lib/Valorae-engine.js';
 
 const MAX_TICKERS = Number(process.env.MAX_TICKERS_PER_REQUEST || 20);
 

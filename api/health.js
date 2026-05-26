@@ -1,4 +1,4 @@
-import { ValoraeEngine } from './_lib/Valorae-engine.js';
+import { ValoraeEngine } from './lib/Valorae-engine.js';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ALLOW_ORIGIN || '*');

@@ -1,4 +1,4 @@
-import { ValoraeEngine, canonicalizeTicker, validarTicker } from './_lib/Valorae-engine.js';
+import { ValoraeEngine, canonicalizeTicker, validarTicker } from './lib/Valorae-engine.js';
 
 function cors(req, res) {
   const origin = process.env.CORS_ALLOW_ORIGIN || '*';

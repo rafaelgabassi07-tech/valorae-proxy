@@ -1,4 +1,4 @@
-import { ValoraeEngine } from './_lib/Valorae-engine.js';
+import { ValoraeEngine } from './lib/Valorae-engine.js';
 
 const MAX_JOBS = Number(process.env.VALORAE_MAX_BATCH_JOBS || 20);
 const MAX_CONCURRENCY = Number(process.env.VALORAE_BATCH_SCRAPE_CONCURRENCY || 4);
