@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Valorae Inspector v21.5.13</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px;background:#0f172a;color:#e2e8f0;line-height:1.45}
+    h1{margin-bottom:4px}.muted{color:#94a3b8}.ok{color:#86efac}.bad{color:#fca5a5}.warn{color:#fde68a}
+    button{padding:10px 14px;border:0;border-radius:10px;cursor:pointer;margin:6px 8px 6px 0;background:#e2e8f0;color:#0f172a;font-weight:650}
+    .grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));margin-top:18px}.card{background:#111827;border:1px solid #334155;border-radius:16px;padding:14px}
+    code{color:#bfdbfe;word-break:break-all}pre{white-space:pre-wrap;max-height:240px;overflow:auto;background:#020617;padding:10px;border-radius:10px}
+  </style>
+</head>
+<body>
+  <h1>Valorae API Inspector</h1>
+  <p class="muted">Painel estático, gratuito e sem token. Testa rotas públicas, ETag, payload, schema, source status, cache stats, catálogo de campos/erros, GET e POST do próprio deploy.</p>
+  <button id="run">Executar auditoria pública</button><button id="download">Baixar relatório JSON</button>
+  <div id="summary" class="muted"></div><div id="results" class="grid"></div>
+<script>
+const tests = [
+  { name:'Health', url:'/api/health' },
+  { name:'Ready', url:'/api/v1/ready' },
+  { name:'Manifest', url:'/api/v1/manifest' },
+  { name:'Environment Catalog', url:'/api/v1/env' },
+  { name:'Schema Catalog', url:'/api/v1/schema' },
+  { name:'Source Status', url:'/api/v1/source/status' },
+  { name:'Cache Stats', url:'/api/v1/cache/stats' },
+  { name:'OpenAPI', url:'/api/openapi' },
+  { name:'Fields Catalog', url:'/api/fields' },
+  { name:'Errors Catalog', url:'/api/errors' },
+  { name:'Asset Compact PETR4', url:'/api/asset?ticker=PETR4&view=compact&profile=fast&fields=ticker,type,status,normalized,parserResilience,schemaStability&maxItems=20' },
+  { name:'Asset Wallet GARE11', url:'/api/asset?ticker=GARE11&view=wallet&profile=fast&lean=1&maxItems=40' },
+  { name:'Batch Cards', url:'/api/assets?tickers=PETR4,GARE11&view=compact&profile=fast&maxItems=20' },
+  { name:'Compare', url:'/api/compare?tickers=PETR4,VALE3,GARE11&maxItems=20' },
+  { name:'Market Rankings', url:'/api/market/rankings?type=FII&source=compare&maxItems=20' },
+  { name:'Portfolio POST', url:'/api/portfolio/analyze', method:'POST', body:{ positions:[{ticker:'PETR4',quantity:10,averagePrice:32,targetPercent:50},{ticker:'GARE11',quantity:20,averagePrice:8.5,targetPercent:50}], cashAvailable:500, view:'standard' } }
+];
+let lastReport = null;
+async function run(){
+  const results=document.getElementById('results'), summary=document.getElementById('summary');
+  results.innerHTML=''; summary.textContent='Executando...'; let ok=0; const report=[];
+  for(const t of tests){
+    const started=performance.now(); let status=0, bytes=0, error='', version='', etag='', cache='', json=null;
+    try{
+      const res=await fetch(t.url,{cache:'no-store',method:t.method||'GET',headers:t.body?{'Content-Type':'application/json'}:{},body:t.body?JSON.stringify(t.body):undefined});
+      status=res.status; etag=res.headers.get('etag')||''; cache=res.headers.get('cache-control')||'';
+      const text=await res.text(); bytes=new Blob([text]).size;
+      try{json=JSON.parse(text); version=json.version||json.data?.version||'';}catch{}
+      if(res.ok) ok++; else error=text.slice(0,220);
+    }catch(e){error=e.message;}
+    const ms=Math.round(performance.now()-started);
+    const item={name:t.name,url:t.url,method:t.method||'GET',status,ms,bytes,version,etag:Boolean(etag),cache,error,quality:json?.quality?.score||json?.data?.quality?.score||json?.dataQualityMatrix?.score,sourceStatus:json?.status||json?.sourceReliability?.status,parserScore:json?.parserResilience?.score||json?.data?.parserResilience?.score};
+    report.push(item);
+    const div=document.createElement('div'); div.className='card';
+    const cls=status>=200&&status<300?'ok':'bad';
+    div.innerHTML=`<h3>${t.name}</h3><p><code>${item.method} ${t.url}</code></p><p>Status: <b class="${cls}">${status||'erro'}</b></p><p>Latência: ${ms}ms · Payload: ${bytes} bytes · ETag: ${etag?'sim':'não'}</p><p>Versão: ${version||'<span class="muted">n/a</span>'}</p><p>Quality: ${item.quality??'n/a'} · Source: ${item.sourceStatus??'n/a'} · Parser: ${item.parserScore??'n/a'}</p>${error?`<p class="bad">${error}</p>`:''}`;
+    results.appendChild(div);
+  }
+  lastReport={generatedAt:new Date().toISOString(),ok,total:tests.length,report};
+  summary.innerHTML=`<p>Concluído: <b class="${ok===tests.length?'ok':'warn'}">${ok}/${tests.length}</b> testes públicos OK.</p>`;
+}
+document.getElementById('run').addEventListener('click',run);
+document.getElementById('download').addEventListener('click',()=>{const blob=new Blob([JSON.stringify(lastReport||{},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='valorae-inspector-report.json';a.click();});
+</script>
+</body>
+</html>
