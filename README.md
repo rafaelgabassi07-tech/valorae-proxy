@@ -66,3 +66,8 @@ Primeiro teste o HTML:
 ```
 
 Se vier `blocked: true` ou `status: 403`, o HTML não chegou ao Vercel. Se vier `htmlLength > 0`, o parser terá conteúdo para extrair.
+
+
+## v19.8.0-fii-quality-fix
+
+Correções focadas no GARE11/FIIs: remove logo genérico do Investidor10, rejeita descrição institucional genérica do site, limpa prefixos residuais em informações do fundo, promove dados cadastrais para o topo do JSON, recalcula patrimônio/PVP a partir do histórico de indicadores e troca DY de checklist pelo yield 12M real quando disponível.
