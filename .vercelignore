@@ -1,7 +1,0 @@
-node_modules
-.vercel
-.env*
-*.zip
-*.patch
-*.log
-.DS_Store
