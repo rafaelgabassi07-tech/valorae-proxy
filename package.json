@@ -1,19 +1,15 @@
 {
-  "name": "nexus-proxy",
-  "version": "18.7.0",
-  "description": "Proxy serverless para scraping B3 (Investidor10 / StatusInvest / Google News) compatível com Vercel - WAF/unhandled rejection fix",
+  "name": "valorae-proxy",
+  "version": "19.2.0",
+  "description": "Servidor proxy Valorae para scraping público de ações e FIIs com Valorae-engine e ValoraeScrape próprio.",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node --check api/asset.js && node --check api/assets.js && node --check api/scrape.js && node --check api/sync.js && node --check api/lib/nexus-engine.js",
-    "dev": "vercel dev",
-    "check": "npm run build"
+    "build": "node -e \"const fs=require('fs');fs.mkdirSync('public',{recursive:true});if(!fs.existsSync('public/index.html'))fs.writeFileSync('public/index.html','<h1>Valorae Proxy</h1>');\"",
+    "check": "node --check api/asset.js && node --check api/assets.js && node --check api/scrape.js && node --check api/batch-scrape.js && node --check api/news.js && node --check api/health.js && node --check api/sync.js && node --check api/index.js && node --check lib/Valorae-engine.js"
   },
   "engines": {
     "node": ">=20.0.0"
   },
-  "dependencies": {
-    "zod": "^3.23.0"
-  },
-  "devDependencies": {}
+  "dependencies": {}
 }
