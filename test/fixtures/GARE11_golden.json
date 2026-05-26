@@ -1,0 +1,57 @@
+{
+  "version": "20.1.0-quality-test-suite",
+  "status": "OK",
+  "partial": false,
+  "ticker": "GARE11",
+  "type": "FII",
+  "mode": "super",
+  "results": {
+    "nome": "GUARDIAN REAL ESTATE",
+    "sobre": "O Guardian Real Estate (GARE11) é um fundo imobiliário com estratégia híbrida, focado na aquisição de ativos logísticos e de renda urbana.",
+    "pvp": 0.89,
+    "dividendYield": "11,97%",
+    "yield12m": "11,96%",
+    "dyMedio5a": "10,77%",
+    "ultimoRendimento": 0.08,
+    "valorPatrimonial": 9.39,
+    "patrimonioLiquido": 2720000000,
+    "numeroCotistas": 511599,
+    "cotasEmitidas": 289186427,
+    "cnpj": "37.295.919/0001-60",
+    "historicoDividendos": [{ "tipo": "Dividendos", "dataCom": "30/04/2026", "dataPagamento": "08/05/2026", "valor": 0.083 }],
+    "historicoIndicadores": {
+      "colunas": ["Atual", "2025"],
+      "linhas": [
+        { "indicador": "Valor Patrimonial", "valores": { "Atual": "R$ 2,72 B", "2025": "R$ 2,11 B" } },
+        { "indicador": "Dividend Yield", "valores": { "Atual": "11,97%", "2025": "11,34%" } },
+        { "indicador": "Número de Cotistas", "valores": { "Atual": "512K", "2025": "426K" } }
+      ]
+    },
+    "sections": {
+      "informacoesFundo": {
+        "cnpj": "37.295.919/0001-60",
+        "numeroCotistas": 511599,
+        "taxaAdministracao": "0,94% - 1,00% a.a sobre PL",
+        "tipoFundo": "Fundo de Tijolo",
+        "segmentoFii": "Híbrido",
+        "tipoGestao": "Ativa",
+        "prazoDuracao": "Indeterminado"
+      },
+      "listaImoveis": [
+        { "nome": "PÃO DE AÇÚCAR - ANGÉLICA", "estado": "São Paulo", "abl": "2.479,00 m²" },
+        { "nome": "BAT SOUZA CRUZ - CACHOEIRINHA", "estado": "Rio Grande do Sul", "abl": "79.984,00 m²" }
+      ],
+      "dividendos": { "dividendYield": "11,97%", "historico": [{ "tipo": "Dividendos", "dataCom": "30/04/2026", "dataPagamento": "08/05/2026", "valor": 0.083 }] },
+      "historicoIndicadores": {
+        "colunas": ["Atual", "2025"],
+        "linhas": [
+          { "indicador": "Valor Patrimonial", "valores": { "Atual": "R$ 2,72 B", "2025": "R$ 2,11 B" } },
+          { "indicador": "Dividend Yield", "valores": { "Atual": "11,97%", "2025": "11,34%" } }
+        ]
+      }
+    }
+  },
+  "coverage": { "informacoesFundo": true, "historicoIndicadores": true, "dividendos": true, "listaImoveis": true, "rentabilidade": true, "comunicados": true },
+  "quality": { "score": 95, "grade": "A", "checks": [], "penalties": [] },
+  "metrics": { "source": "ValoraeScrape+Investidor10HTML+Investidor10InternalAPIs+YahooChart", "scrapeStatus": "HTML_PARSED", "sourcesTried": [{ "name": "Investidor10", "provider": "ValoraeScrape", "status": 200, "ok": true, "htmlLength": 1450000 }] }
+}

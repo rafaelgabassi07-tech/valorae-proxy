@@ -1,1 +1,63 @@
-
+{
+  "version": "20.1.0-quality-test-suite",
+  "status": "OK",
+  "partial": false,
+  "ticker": "PETR4",
+  "type": "ACAO",
+  "mode": "super",
+  "results": {
+    "nome": "PETR4",
+    "precoAtual": 43.4,
+    "variacaoDay": "-2.43%",
+    "variacao12m": "50,38%",
+    "pl": 5.2,
+    "pvp": 1.26,
+    "psr": 1.12,
+    "dividendYield": "7,08%",
+    "payout": "38,98%",
+    "margemLiquida": "21,60%",
+    "margemEbitda": "46,35%",
+    "pCapGiro": -11.5,
+    "pAtivoCircLiq": -0.51,
+    "roe": "24,17%",
+    "roic": "12,95%",
+    "cnpj": "33.000.167/0001-01",
+    "historicoDividendos": [{ "tipo": "JSCP", "dataCom": "01/06/2026", "dataPagamento": "20/08/2026", "valor": 0.35048636 }],
+    "indicadoresFundamentalistas": {
+      "semComparativos": {
+        "pl": 5.2,
+        "pvp": 1.26,
+        "dy": "7,08%",
+        "margemLiquida": "21,60%",
+        "margemEbitda": "46,35%",
+        "pCapGiro": -11.5,
+        "pAtivoCircLiq": -0.51
+      }
+    },
+    "dadosEmpresa": {
+      "nomeCompleto": "PETROLEO BRASILEIRO S.A. PETROBRAS",
+      "cnpj": "33.000.167/0001-01",
+      "anoFundacao": 1953,
+      "anoEstreiaB3": 1977
+    },
+    "informacoesEmpresa": {
+      "valorDeMercado": 599410206000,
+      "valorDeFirma": 923501206000,
+      "patrimonioLiquido": 445189000000,
+      "totalPapeis": 12888732000,
+      "dividaBruta": 371691000000,
+      "dividaLiquida": 324091000000,
+      "disponibilidade": 47600000000,
+      "liquidezMediaDiaria": 2346189000,
+      "setor": "Petróleo, Gás e Biocombustíveis",
+      "segmento": "Exploração, Refino e Distribuição"
+    },
+    "sections": {
+      "dividendos": { "dividendYield": "7,08%", "historico": [{ "tipo": "JSCP", "dataCom": "01/06/2026", "dataPagamento": "20/08/2026", "valor": 0.35048636 }] },
+      "empresa": { "dados": { "cnpj": "33.000.167/0001-01" } }
+    }
+  },
+  "coverage": { "indicadores": true, "dividendos": true, "dadosEmpresa": true, "rentabilidade": true, "comparadorAcoes": true, "comunicados": true },
+  "quality": { "score": 94, "grade": "A", "checks": [], "penalties": [] },
+  "metrics": { "source": "ValoraeScrape+Investidor10HTML+Investidor10InternalAPIs+YahooChart", "scrapeStatus": "HTML_PARSED", "sourcesTried": [{ "name": "Investidor10", "provider": "ValoraeScrape", "status": 200, "ok": true, "htmlLength": 2000000 }] }
+}
