@@ -12,6 +12,10 @@ function boolParam(v) {
   return ['1', 'true', 'yes', 'sim', 'on'].includes(String(v || '').toLowerCase());
 }
 
+function falseParam(v) {
+  return ['0', 'false', 'no', 'nao', 'não', 'off'].includes(String(v || '').toLowerCase());
+}
+
 function getBaseUrl(req) {
   const explicit = process.env.VALORAE_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL;
   if (explicit) return explicit.replace(/\/$/, '');
@@ -47,8 +51,12 @@ export default async function handler(req, res) {
       timeoutMs: Number(input.timeoutMs || process.env.VALORAE_FETCH_TIMEOUT_MS || 12000),
       maxHtmlChars: Number(input.maxHtmlChars || process.env.VALORAE_MAX_HTML_CHARS || 3200000),
       valoraeScrapeUrl: input.scrapeUrl || `${getBaseUrl(req)}/api/scrape`,
+      cache: !(boolParam(input.nocache || input.refresh) || falseParam(input.cache)),
+      bypassCache: boolParam(input.nocache || input.refresh),
+      debug: boolParam(input.debug),
     });
 
+    res.setHeader('X-Valorae-Engine-Version', ValoraeEngine.version);
     return res.status(200).json(payload);
   } catch (err) {
     return res.status(500).json({

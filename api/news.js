@@ -19,5 +19,6 @@ export default async function handler(req, res) {
 
   const aliases = typeof req.query.aliases === 'string' ? req.query.aliases.split(',').map(s => s.trim()).filter(Boolean) : [];
   const news = await ValoraeEngine.fetchNews(ticker, aliases, { limit: Number(req.query.limit || 8) });
-  return res.status(200).json({ version: ValoraeEngine.version, ticker, ...news });
+  res.setHeader('X-Valorae-Engine-Version', ValoraeEngine.version);
+    return res.status(200).json({ version: ValoraeEngine.version, ticker, ...news });
 }

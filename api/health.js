@@ -1,4 +1,4 @@
-import { ValoraeEngine } from './lib/Valorae-engine.js';
+import { ValoraeEngine, getValoraeRuntimeStats } from './lib/Valorae-engine.js';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ALLOW_ORIGIN || '*');
@@ -9,6 +9,8 @@ export default async function handler(req, res) {
     version: ValoraeEngine.version,
     runtime: 'vercel-node',
     time: new Date().toISOString(),
-    endpoints: ['/api/asset?ticker=PETR4&mode=super&includeNews=1', '/api/assets?tickers=PETR4,GARE11', '/api/scrape?url=https://investidor10.com.br/acoes/petr4/', '/api/news?ticker=PETR4', '/api/batch-scrape'],
+    runtimeStats: getValoraeRuntimeStats(),
+    capabilities: ['schema-validation','quality-score','debug=1','portfolio-stats','financial-summary','golden-tests','multi-source-fallback'],
+    endpoints: ['/api/asset?ticker=PETR4&mode=super&includeNews=1&debug=1', '/api/assets?tickers=PETR4,GARE11', '/api/scrape?url=https://investidor10.com.br/acoes/petr4/', '/api/news?ticker=PETR4', '/api/batch-scrape'],
   });
 }
