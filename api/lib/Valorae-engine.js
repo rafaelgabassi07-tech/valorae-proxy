@@ -1,8 +1,10 @@
 // Valorae-engine.js
+import { enrichAssetResults, buildSchemaValidation, augmentQualityReport, buildSourceReport, buildDebugInfo, VALORAE_SCHEMA_VERSION } from './quality/schema.js';
+
 // Motor novo do Valorae Proxy para Vercel/GitHub.
 // Foco: dados públicos de ações/FIIs, diagnóstico claro, sem dados sintéticos.
 
-export const VALORAE_ENGINE_VERSION = '19.9.0-json-quality-fix';
+export const VALORAE_ENGINE_VERSION = '20.1.0-quality-test-suite';
 
 const DEFAULT_TIMEOUT_MS = intEnv('VALORAE_FETCH_TIMEOUT_MS', 12000);
 const DEFAULT_MAX_HTML_CHARS = intEnv('VALORAE_MAX_HTML_CHARS', 3_200_000);
@@ -11,6 +13,14 @@ const NEWS_CACHE_TTL_MS = intEnv('VALORAE_NEWS_CACHE_TTL_MS', 15 * 60 * 1000);
 const HTML_CACHE_TTL_MS = intEnv('VALORAE_HTML_CACHE_TTL_MS', 2 * 60 * 1000);
 const ENABLE_INVESTIDOR10_INTERNAL_APIS = boolEnv('VALORAE_ENABLE_INTERNAL_APIS', true);
 const USE_YAHOO_FOR_CURRENT_QUOTE = boolEnv('VALORAE_USE_YAHOO_FOR_CURRENT_QUOTE', true);
+
+// Cache final do JSON, inspirado no Scraper (4), mas com chave versionada e bypass por nocache/refresh.
+// Mantém velocidade em instâncias quentes sem repetir HTML+APIs internas para o mesmo ticker.
+const ASSET_RESULT_CACHE_ENABLED = boolEnv('VALORAE_ASSET_RESULT_CACHE_ENABLED', true);
+const ASSET_RESULT_CACHE_TTL_MS = intEnv('VALORAE_ASSET_RESULT_CACHE_TTL_MS', 5 * 60 * 1000);
+const ASSET_RESULT_CACHE_MAX_ENTRIES = intEnv('VALORAE_ASSET_RESULT_CACHE_MAX_ENTRIES', 250);
+const ASSET_RESULT_CACHE_MAX_BYTES = intEnv('VALORAE_ASSET_RESULT_CACHE_MAX_BYTES', 32 * 1024 * 1024);
+
 
 // Camada ValoraeScrape self-contained.
 // Em produção, /api/asset chama o próprio /api/scrape do mesmo domínio,
@@ -37,6 +47,12 @@ const ALLOWED_HOSTS = new Set([
   'news.google.com',
 ]);
 
+const KNOWN_B3_UNITS = new Set([
+  // Unidades B3: terminam em 11, mas são ações/units, não FIIs.
+  'ALUP11','BPAC11','BRBI11','ENGI11','KLBN11','SANB11','SAPR11','TAEE11','AESB11',
+  'RNEW11','APER11','MODL11','SULA11','BIDI11','IGTI11','CPLE11'
+]);
+
 const ETF_TICKERS = new Set([
   'BOVA11','IVVB11','SMAL11','DIVO11','FIND11','MATB11','GOVE11','XFIX11','GOLD11','SPXI11',
   'HASH11','BOVB11','BOVS11','BRAX11','XINA11','EURP11','FIXA11','ECOO11','ACWI11','NASD11',
@@ -48,6 +64,10 @@ const ETF_TICKERS = new Set([
 
 const htmlCache = new Map();
 const newsCache = new Map();
+const assetResultCache = new Map();
+const assetResultInFlight = new Map();
+let assetResultCacheBytes = 0;
+
 
 function intEnv(name, fallback) {
   const raw = typeof process !== 'undefined' ? process.env?.[name] : undefined;
@@ -112,6 +132,7 @@ export function validarTicker(ticker = '') {
 export function inferAssetType(ticker = '') {
   const t = canonicalizeTicker(ticker);
   if (ETF_TICKERS.has(t)) return 'ETF';
+  if (KNOWN_B3_UNITS.has(t)) return 'ACAO';
   if (/3[2-5]$/.test(t)) return 'BDR';
   if (t.endsWith('11')) return 'FII';
   if (/^[A-Z]{1,5}$/.test(t)) return 'STOCK';
@@ -290,6 +311,86 @@ function stableStringify(value) {
   if (!value || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+}
+
+function deepClone(value) {
+  if (value === undefined || value === null) return value;
+  try { return structuredClone(value); } catch (_) {
+    try { return JSON.parse(JSON.stringify(value)); } catch (__) { return value; }
+  }
+}
+
+function assetResultCacheEnabled(options = {}) {
+  if (!ASSET_RESULT_CACHE_ENABLED) return false;
+  if (options.cache === false || options.bypassCache === true || options.refresh === true || options.nocache === true) return false;
+  return true;
+}
+
+function assetResultCacheKey(ticker, type, options = {}) {
+  return stableStringify({
+    v: VALORAE_ENGINE_VERSION,
+    ticker: canonicalizeTicker(ticker),
+    type: String(type || inferAssetType(ticker)).toUpperCase(),
+    mode: options.mode || 'super',
+    includeNews: options.includeNews === true || options.includeNews === '1',
+    newsLimit: Number(options.newsLimit || DEFAULT_NEWS_LIMIT),
+    yahoo: options.useYahooFallback !== false,
+    maxHtmlChars: Number(options.maxHtmlChars || DEFAULT_MAX_HTML_CHARS),
+    internalApis: ENABLE_INVESTIDOR10_INTERNAL_APIS
+  });
+}
+
+function assetResultCacheTouch(key, entry) {
+  assetResultCache.delete(key);
+  assetResultCache.set(key, entry);
+}
+
+function assetResultCacheDelete(key) {
+  const entry = assetResultCache.get(key);
+  if (!entry) return;
+  assetResultCacheBytes = Math.max(0, assetResultCacheBytes - entry.bytes);
+  assetResultCache.delete(key);
+}
+
+function assetResultCacheGet(key) {
+  const entry = assetResultCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    assetResultCacheDelete(key);
+    return null;
+  }
+  assetResultCacheTouch(key, entry);
+  return deepClone(entry.data);
+}
+
+function assetResultCacheSet(key, data, ttlMs = ASSET_RESULT_CACHE_TTL_MS) {
+  if (!data || ttlMs <= 0) return;
+  const cloned = deepClone(data);
+  const bytes = Buffer.byteLength(JSON.stringify(cloned), 'utf8');
+  if (bytes > ASSET_RESULT_CACHE_MAX_BYTES) return;
+  assetResultCacheDelete(key);
+  while (
+    assetResultCache.size >= ASSET_RESULT_CACHE_MAX_ENTRIES ||
+    assetResultCacheBytes + bytes > ASSET_RESULT_CACHE_MAX_BYTES
+  ) {
+    const oldest = assetResultCache.keys().next().value;
+    if (!oldest) break;
+    assetResultCacheDelete(oldest);
+  }
+  assetResultCache.set(key, { data: cloned, bytes, expiresAt: Date.now() + ttlMs });
+  assetResultCacheBytes += bytes;
+}
+
+export function getValoraeRuntimeStats() {
+  return {
+    version: VALORAE_ENGINE_VERSION,
+    caches: {
+      assetResult: { enabled: ASSET_RESULT_CACHE_ENABLED, entries: assetResultCache.size, bytes: assetResultCacheBytes, ttlMs: ASSET_RESULT_CACHE_TTL_MS },
+      html: { entries: htmlCache.size, ttlMs: HTML_CACHE_TTL_MS },
+      scrapeResponse: { entries: valoraeScrapeResponseCache.size, bytes: valoraeScrapeResponseCacheBytes, ttlMs: VALORAE_SCRAPE_CACHE_TTL_MS },
+      news: { entries: newsCache.size, ttlMs: NEWS_CACHE_TTL_MS }
+    }
+  };
 }
 
 function valoraeScrapeTargetHeaders(url) {
@@ -1949,6 +2050,51 @@ function buildCoverage(type, results = {}) {
   };
 }
 
+
+function buildQualityReport(type, results = {}, coverage = {}, warnings = []) {
+  const checks = [];
+  let score = 0;
+  let max = 0;
+  const add = (name, ok, weight, note = '') => {
+    const passed = !!ok;
+    checks.push({ name, ok: passed, weight, note });
+    max += weight;
+    if (passed) score += weight;
+  };
+
+  if (type === 'FII') {
+    add('identidade', !!(results.nome || results.sobre || results.cnpj), 10, 'Nome, CNPJ ou descrição do fundo.');
+    add('informacoesFundo', !!(coverage.informacoesFundo || results.informacoesFundo || results.numeroCotistas), 14, 'Dados cadastrais do FII.');
+    add('indicadoresFii', !!(results.pvp || results.dividendYield || results.yield12m || results.valorPatrimonial), 14, 'P/VP, DY, VP/cota e yields.');
+    add('historicoIndicadores', !!coverage.historicoIndicadores, 14, 'Histórico anual de indicadores.');
+    add('dividendos', !!coverage.dividendos, 14, 'Histórico de distribuições.');
+    add('rentabilidade', !!coverage.rentabilidade, 10, 'Rentabilidade nominal/real e/ou gráfico.');
+    add('portfolioImoveis', !!coverage.listaImoveis, 10, 'Lista de imóveis/portfólio.');
+    add('comparativos', !!(coverage.comparacaoIndices || coverage.mediaTipoSegmento || results.rentabilidadeVsIndicadores), 8, 'Comparativos com índices, tipo ou segmento.');
+    add('comunicadosNoticias', !!coverage.comunicados, 6, 'Comunicados ou notícias relacionadas.');
+  } else {
+    add('cotacao', !!(results.precoAtual || results.variacaoDay || results.variacao12m), 10, 'Cotação atual e variações.');
+    add('indicadores', !!coverage.indicadores, 16, 'Indicadores fundamentalistas.');
+    add('comparativoSetor', !!(results.comparativoSetor || results.indicadoresFundamentalistas?.comparativoSetor), 12, 'Comparação setor/subsetor/segmento.');
+    add('empresa', !!(coverage.dadosEmpresa || results.dadosEmpresa || results.informacoesEmpresa), 12, 'Dados cadastrais e informações corporativas.');
+    add('dividendos', !!coverage.dividendos, 12, 'Dividendos e DY.');
+    add('rentabilidade', !!coverage.rentabilidade, 10, 'Rentabilidade nominal/real.');
+    add('checklist', !!coverage.checklistBah, 8, 'Checklist buy and hold.');
+    add('comparadorPares', !!coverage.comparadorAcoes, 8, 'Tabela de pares/concorrentes.');
+    add('graficosFinanceiros', !!(coverage.receitasLucros || coverage.lucroCotacao || coverage.evolucaoPatrimonio || coverage.graficos), 8, 'Gráficos e APIs internas.');
+    add('comunicadosNoticias', !!coverage.comunicados, 4, 'Comunicados ou notícias relacionadas.');
+  }
+
+  const penalties = [];
+  if (isGenericInvestidor10Logo(results.logoUrl)) penalties.push({ code: 'GENERIC_LOGO', points: 4, message: 'logoUrl genérico do Investidor10 detectado.' });
+  if (isGenericAboutText(results.sobre)) penalties.push({ code: 'GENERIC_ABOUT', points: 6, message: 'Descrição genérica detectada.' });
+  if (warnings?.length) penalties.push({ code: 'WARNINGS', points: Math.min(8, warnings.length * 2), message: `${warnings.length} aviso(s) no processamento.` });
+
+  const penaltyPoints = penalties.reduce((sum, p) => sum + p.points, 0);
+  const pct = max ? Math.max(0, Math.min(100, Math.round((score / max) * 100 - penaltyPoints))) : 0;
+  return { score: pct, grade: pct >= 90 ? 'A' : pct >= 75 ? 'B' : pct >= 60 ? 'C' : 'D', checks, penalties };
+}
+
 async function fetchYahooChart(ticker) {
   const t = canonicalizeTicker(ticker);
   const symbol = /^[A-Z]{1,5}$/.test(t) ? t : `${t}.SA`;
@@ -2044,7 +2190,48 @@ function scoreNews(item, ticker, aliases) {
 export class ValoraeEngine {
   static version = VALORAE_ENGINE_VERSION;
 
+  static cacheStats() {
+    return getValoraeRuntimeStats();
+  }
+
   static async fetchAtivo(rawTicker, rawType, options = {}) {
+    const ticker = canonicalizeTicker(rawTicker);
+    const validation = validarTicker(ticker);
+    if (validation) throw new Error(validation);
+    const type = rawType || inferAssetType(ticker);
+    const cacheEnabled = assetResultCacheEnabled(options);
+    const key = cacheEnabled ? assetResultCacheKey(ticker, type, options) : '';
+
+    if (cacheEnabled) {
+      const cached = assetResultCacheGet(key);
+      if (cached) {
+        cached.cacheStatus = 'RESULT_CACHE_HIT';
+        cached.metrics = { ...(cached.metrics || {}), resultCache: 'HIT', resultCacheServedAt: nowIso() };
+        return cached;
+      }
+      const inFlight = assetResultInFlight.get(key);
+      if (inFlight) {
+        const payload = deepClone(await inFlight);
+        payload.cacheStatus = 'RESULT_CACHE_COALESCED';
+        payload.metrics = { ...(payload.metrics || {}), resultCache: 'COALESCED', resultCacheServedAt: nowIso() };
+        return payload;
+      }
+    }
+
+    const promise = ValoraeEngine._fetchAtivoUncached(ticker, type, options);
+    if (cacheEnabled) assetResultInFlight.set(key, promise);
+    try {
+      const payload = await promise;
+      if (cacheEnabled && payload?.status !== 'ERROR') assetResultCacheSet(key, payload, Number(options.resultCacheTtlMs || ASSET_RESULT_CACHE_TTL_MS));
+      payload.cacheStatus = cacheEnabled ? 'RESULT_CACHE_MISS' : 'RESULT_CACHE_BYPASS';
+      payload.metrics = { ...(payload.metrics || {}), resultCache: payload.cacheStatus, resultCacheTtlMs: cacheEnabled ? Number(options.resultCacheTtlMs || ASSET_RESULT_CACHE_TTL_MS) : 0 };
+      return payload;
+    } finally {
+      if (cacheEnabled) assetResultInFlight.delete(key);
+    }
+  }
+
+  static async _fetchAtivoUncached(rawTicker, rawType, options = {}) {
     const started = performance.now();
     const ticker = canonicalizeTicker(rawTicker);
     const validation = validarTicker(ticker);
@@ -2118,6 +2305,7 @@ export class ValoraeEngine {
     }
 
     results = postProcessResultsByType(ticker, type, results);
+    results = enrichAssetResults(ticker, type, results);
 
     if (!parse) {
       const blocked = sourcesTried.find(s => s.blocked || s.status === 403 || s.status === 401 || s.status === 429);
@@ -2136,7 +2324,9 @@ export class ValoraeEngine {
     const status = partial ? 'PARTIAL' : 'OK';
     if (!foundKeys.length) warnings.push('Nenhuma fonte retornou dados úteis para este ticker.');
 
-    return {
+    const coverage = buildCoverage(type, results);
+    let payload = {
+      schemaVersion: VALORAE_SCHEMA_VERSION,
       version: VALORAE_ENGINE_VERSION,
       status,
       partial,
@@ -2146,11 +2336,13 @@ export class ValoraeEngine {
       results,
       cacheStatus: parse ? 'LIVE_HTML' : 'ERROR',
       warnings: uniq(warnings),
-      coverage: buildCoverage(type, results),
+      coverage,
+      quality: buildQualityReport(type, results, coverage, uniq(warnings)),
       news: news?.items,
       newsStatus: includeNews ? { ok: news?.ok, source: news?.source, error: news?.error } : undefined,
       metrics: {
         engineVersion: VALORAE_ENGINE_VERSION,
+        schemaVersion: VALORAE_SCHEMA_VERSION,
         totalTimeMs: Math.round(performance.now() - started),
         source,
         sourcesTried,
@@ -2163,8 +2355,14 @@ export class ValoraeEngine {
         scrapeStatus: parse ? 'HTML_PARSED' : 'NO_HTML_DATA',
         scrapeError: !parse ? (sourcesTried.find(s => s.error)?.error || 'Sem HTML') : undefined,
         generatedAt: nowIso(),
+        runtime: getValoraeRuntimeStats(),
       },
     };
+    payload.validation = buildSchemaValidation(payload);
+    payload.sourceReport = buildSourceReport(payload);
+    payload.quality = augmentQualityReport(payload);
+    if (options.debug === true || options.debug === '1') payload.debug = buildDebugInfo(payload, { providerOrder: ['Investidor10', 'StatusInvest', 'YahooChart', 'GoogleNews'], includeRawHtml: false });
+    return payload;
   }
 
   static async fetchAtivosBatch(tickers, options = {}) {
