@@ -1,12 +1,13 @@
 {
   "name": "valorae-proxy",
-  "version": "19.9.0",
-  "description": "Servidor proxy Valorae para scraping público de ações e FIIs com correção de qualidade de JSON para ações e FIIs.",
+  "version": "20.1.0",
+  "description": "Servidor proxy Valorae para scraping público de ações e FIIs com schema oficial, quality score, debug mode, testes dourados e melhorias inspiradas no Scraper 4.",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node -e \"const fs=require('fs');fs.mkdirSync('public',{recursive:true});if(!fs.existsSync('public/index.html'))fs.writeFileSync('public/index.html','<h1>Valorae Proxy</h1>');\"",
-    "check": "node --check api/asset.js && node --check api/assets.js && node --check api/scrape.js && node --check api/batch-scrape.js && node --check api/news.js && node --check api/health.js && node --check api/sync.js && node --check api/index.js && node --check api/lib/Valorae-engine.js"
+    "check": "node --check api/asset.js && node --check api/assets.js && node --check api/scrape.js && node --check api/batch-scrape.js && node --check api/news.js && node --check api/health.js && node --check api/sync.js && node --check api/index.js && node --check api/lib/Valorae-engine.js && node --check api/lib/normalizers/financial.js && node --check api/lib/quality/schema.js && node --check test/golden.test.js",
+    "test": "node test/golden.test.js"
   },
   "engines": {
     "node": ">=20.0.0"
