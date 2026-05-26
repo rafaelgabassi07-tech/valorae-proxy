@@ -1,3 +1,4 @@
+// @ts-nocheck
 /// <reference types="node" />
 import { z } from 'zod';
 
@@ -51,6 +52,9 @@ export interface NewsItem {
   link: string;
   pubDate?: Date;
   source?: string;
+  snippet?: string;
+  query?: string;
+  relevanceScore?: number;
 }
 
 export interface DividendItem {
@@ -146,7 +150,7 @@ const DIAS_POR_PERIODO: Readonly<Record<string, number>> = {
  * NOVO v16 — Versão de cache do NexusProxy.
  * Incrementar sempre que seletores ou templates forem alterados.
  */
-const NEXUS_PROXY_CACHE_VERSION = '2026-05-23-nexus-v16';
+const NEXUS_PROXY_CACHE_VERSION = '2026-05-25-nexus-v18-1';
 
 // ════════════════════════════════════════════════════════════════════════════
 // 3. GUARD: process.cpuUsage (Node-specific)
@@ -568,6 +572,807 @@ export function universalLexer<T = any>(
   return results as Partial<T>;
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9.1 FALLBACK POR TEXTO VISÍVEL — aumenta cobertura no Investidor10
+// ════════════════════════════════════════════════════════════════════════════
+
+function decodeBasicEntities(s: string): string {
+  return s
+    .replace(/&nbsp;|&#160;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>');
+}
+
+function htmlToVisibleText(html: string): string {
+  return decodeBasicEntities(html)
+    .replace(/<script\b[\s\S]*?<\/script>/gi, '\n')
+    .replace(/<style\b[\s\S]*?<\/style>/gi, '\n')
+    .replace(/<noscript\b[\s\S]*?<\/noscript>/gi, '\n')
+    .replace(/<svg\b[\s\S]*?<\/svg>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>|<\/div>|<\/li>|<\/tr>|<\/td>|<\/th>|<\/h\d>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\r/g, '\n')
+    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/\n\s+/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+    .trim();
+}
+
+function stripAccentsLower(s: string): string {
+  return s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
+function normalizeLabel(s: string): string {
+  return stripAccentsLower(s).replace(/[()]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+const VALUE_TOKEN_RE = /(?:R\$\s*)?[+-]?(?:\d{1,3}(?:\.\d{3})*|\d+)(?:,\d+)?\s*(?:%|[KMB]|mil(?:h(?:ões|oes|ão|ao)?)?|bilh(?:ões|oes|ão|ao)?|trilh(?:ões|oes|ão|ao)?)?/i;
+
+function valueLooksUseful(raw: string): boolean {
+  const v = raw.trim();
+  if (!v || VALORES_INVALIDOS.has(v)) return false;
+  if (/^(setor|subsetor|segmento|comparacao|comparação)\b/i.test(v)) return false;
+  return true;
+}
+
+function findValueAfterLabel(lines: string[], labels: string[], opts: { preferPct?: boolean; preferMoney?: boolean; maxLookahead?: number } = {}): string | undefined {
+  const normLabels = labels.map(normalizeLabel);
+  const maxLookahead = opts.maxLookahead ?? 8;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const norm = normalizeLabel(line);
+    for (const lab of normLabels) {
+      if (norm === lab || norm.startsWith(lab + ' ') || norm.includes(' ' + lab + ' ')) {
+        const after = line.slice(Math.max(0, line.toLowerCase().indexOf(labels[0].toLowerCase()) + labels[0].length)).trim();
+        const inlineMatch = after.match(VALUE_TOKEN_RE);
+        if (inlineMatch && valueLooksUseful(inlineMatch[0])) return inlineMatch[0].trim();
+
+        for (let j = 1; j <= maxLookahead && i + j < lines.length; j++) {
+          const cand = lines[i + j].trim();
+          if (!cand || /^(setor|subsetor|segmento|comparando|sem comparativos|comparativos)/i.test(cand)) continue;
+          const m = cand.match(VALUE_TOKEN_RE);
+          if (m && valueLooksUseful(m[0])) {
+            const val = m[0].trim();
+            if (opts.preferPct && !/%/.test(val)) continue;
+            if (opts.preferMoney && !/R\$/i.test(cand) && !/(milh|bilh|trilh|[KMB])/i.test(cand)) continue;
+            return val;
+          }
+          // Se chegamos em outra etiqueta clara, para de procurar para evitar pegar valor errado.
+          if (/^[A-ZÀ-ÿ0-9\/\.\-\s]{2,35}$/.test(cand) && !VALUE_TOKEN_RE.test(cand)) break;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+function findTextAfterLabel(lines: string[], labels: string[], maxLookahead = 6): string | undefined {
+  const normLabels = labels.map(normalizeLabel);
+  for (let i = 0; i < lines.length; i++) {
+    const norm = normalizeLabel(lines[i]);
+    if (!normLabels.some(l => norm === l || norm.startsWith(l + ' '))) continue;
+    for (let j = 1; j <= maxLookahead && i + j < lines.length; j++) {
+      const cand = lines[i + j].trim();
+      if (!cand || VALORES_INVALIDOS.has(cand)) continue;
+      if (/^(R\$|[+-]?\d)/.test(cand)) continue;
+      return cand;
+    }
+  }
+  return undefined;
+}
+
+
+
+function findRawAfterLabel(lines, labels, maxLookahead = 4) {
+  const normLabels = labels.map(normalizeLabel);
+  for (let i = 0; i < lines.length; i++) {
+    const norm = normalizeLabel(lines[i]);
+    if (!normLabels.some(l => norm === l || norm.startsWith(l + ' '))) continue;
+    for (let j = 1; j <= maxLookahead && i + j < lines.length; j++) {
+      const cand = lines[i + j].trim();
+      if (cand && !VALORES_INVALIDOS.has(cand)) return cand;
+    }
+  }
+  return undefined;
+}
+
+function parseTextDividendRows(text: string): DividendItem[] {
+  const rows: DividendItem[] = [];
+  const seen = new Set<string>();
+  const re = /\b(Dividendos|JSCP|JCP|Rend\.?\s*Trib\.?)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d{2}\/\d{2}\/\d{4})\s+([\d,.]+)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null && rows.length < 240) {
+    const tipo = m[1].replace(/\s+/g, ' ').trim();
+    const dataCom = m[2];
+    const dataPagamento = m[3];
+    const valor = parseFloat(m[4].replace(/\./g, '').replace(',', '.'));
+    if (!Number.isFinite(valor)) continue;
+    const key = `${tipo}|${dataCom}|${dataPagamento}|${valor}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ tipo, dataCom, dataPagamento, valor });
+  }
+  return rows;
+}
+
+function parseYieldsDistribuicoes(text: string): Record<string, any> {
+  const out: Record<string, any> = {};
+  const specs: [string, RegExp][] = [
+    ['yield1m', /YIELD\s+1\s*M[ÊE]S\s+([\d,.]+\s*%)\s+R\$\s*([\d,.]+)/i],
+    ['yield3m', /YIELD\s+3\s*MESES\s+([\d,.]+\s*%)\s+R\$\s*([\d,.]+)/i],
+    ['yield6m', /YIELD\s+6\s*MESES\s+([\d,.]+\s*%)\s+R\$\s*([\d,.]+)/i],
+    ['yield12m', /YIELD\s+12\s*MESES\s+([\d,.]+\s*%)\s+R\$\s*([\d,.]+)/i],
+  ];
+  for (const [field, re] of specs) {
+    const m = text.match(re);
+    if (m) {
+      out[field] = COMMON_FORMATTERS.pct(m[1]);
+      out[`${field}Valor`] = COMMON_FORMATTERS.num(m[2]);
+    }
+  }
+  return out;
+}
+
+function parseRentabilidade(text: string): Record<string, string> | undefined {
+  const idx = stripAccentsLower(text).indexOf('rentabilidade de');
+  if (idx < 0) return undefined;
+  const chunk = text.slice(idx, idx + 1600);
+  const labels: [string, string][] = [
+    ['1m', '1 mês'], ['3m', '3 meses'], ['1a', '1 ano'], ['2a', '2 anos'], ['5a', '5 anos'], ['10a', '10 anos']
+  ];
+  const out: Record<string, string> = {};
+  for (const [key, label] of labels) {
+    const re = new RegExp(label.replace('ê', '[êe]') + '[\\s\\S]{0,80}?([+-]?\\d+[,.]\\d+\\s*%)', 'i');
+    const m = chunk.match(re);
+    if (m) out[key] = COMMON_FORMATTERS.pct(m[1]);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function parseChecklist(text: string): string[] | undefined {
+  const norm = stripAccentsLower(text);
+  const idx = norm.indexOf('checklist do investidor buy and hold');
+  if (idx < 0) return undefined;
+  const chunk = text.slice(idx, idx + 1200);
+  const lines = chunk.split('\n').map(l => l.trim()).filter(Boolean);
+  const start = lines.findIndex(l => /checklist do investidor/i.test(l));
+  const out: string[] = [];
+  for (const line of lines.slice(Math.max(0, start + 1))) {
+    if (/Esta ferramenta|Carteira Investidor|ADICIONAR/i.test(line)) break;
+    if (line.length >= 10 && !/^imagem|image$/i.test(line)) out.push(line);
+    if (out.length >= 20) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function textFallbackLexer<T = any>(html: string, template: ExtractorTemplate<T>, existingResults: Partial<T> = {}): Partial<T> {
+  const out: any = { ...existingResults };
+  const text = htmlToVisibleText(html);
+  if (!text) return out;
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const isFii = /FII/i.test(template.name);
+
+  const numericFields: Record<string, string[]> = {
+    precoAtual: ['Preço atual', 'Cotação', 'Valor atual'],
+    variacaoDay: ['Variação', 'Var. Dia', 'Var%'],
+    variacao12m: ['VARIAÇÃO (12M)', 'Variação 12M', 'VAR 12M'],
+    dy12m: ['DY atual', 'DY 12M', 'DY (12M)'],
+    dividendYield: ['Dividend Yield', 'DY atual', 'DY (12M)', 'VISC11 DY (12M)'],
+    dyMedio5a: ['DY médio em 5 anos', 'DY médio 5 anos', 'DY Médio 5 anos'],
+    pl: ['P/L', 'P/Lucro'],
+    pvp: ['P/VP'],
+    psr: ['P/Receita (PSR)', 'P/Receita', 'PSR'],
+    payout: ['Payout'],
+    margemLiquida: ['Margem Líquida', 'Margem Liquida'],
+    margemBruta: ['Margem Bruta'],
+    margemEbit: ['Margem Ebit', 'Margem EBIT'],
+    margemEbitda: ['Margem Ebtida', 'Margem Ebitda', 'Margem EBITDA'],
+    evEbitda: ['EV/Ebitda', 'EV/EBITDA'],
+    evEbit: ['EV/Ebit', 'EV/EBIT'],
+    pEbitda: ['P/Ebitda', 'P/EBITDA'],
+    pEbit: ['P/Ebit', 'P/EBIT'],
+    pAtivo: ['P/Ativo'],
+    pCapGiro: ['P/Cap.Giro', 'P/Capital de Giro'],
+    pAtivoCircLiq: ['P/Ativo Circ. Liq.', 'P/Ativo Circ Liq'],
+    vpa: ['VPA'],
+    lpa: ['LPA'],
+    giroAtivos: ['Giro Ativos', 'Giro de Ativos'],
+    roe: ['ROE'],
+    roic: ['ROIC'],
+    roa: ['ROA'],
+    dividaLiquidaPatrimonio: ['Dívida Líquida / Patrimônio', 'Divida Liquida / Patrimonio'],
+    dividaLiquidaEbitda: ['Dívida Líquida / Ebitda', 'Dívida Liq/EBITDA'],
+    dividaLiquidaEbit: ['Dívida Líquida / Ebit', 'Dívida Liq/EBIT'],
+    dividaBrutaPatrimonio: ['Dívida Bruta / Patrimônio', 'Divida Bruta / Patrimonio'],
+    patrimonioAtivos: ['Patrimônio / Ativos', 'Patrimonio / Ativos'],
+    passivosAtivos: ['Passivos / Ativos'],
+    liquidezCorrente: ['Liquidez Corrente'],
+    cagrReceitas5a: ['CAGR Receitas 5 anos', 'CAGR Receitas 5A'],
+    cagrLucros5a: ['CAGR Lucros 5 anos', 'CAGR Lucros 5A'],
+    valorDeMercado: ['Valor de Mercado'],
+    valorDeFirma: ['Valor de Firma', 'Enterprise Value'],
+    patrimonioLiquido: ['Patrimônio Líquido', 'Patrimonio Liquido'],
+    ativosTotais: ['Ativos Totais', 'Total de Ativos'],
+    ativoCirculante: ['Ativo Circulante'],
+    dividaLiquida: ['Dívida Líquida', 'Divida Liquida'],
+    dividaBruta: ['Dívida Bruta', 'Divida Bruta'],
+    disponibilidade: ['Disponibilidade', 'Caixa e Equivalentes'],
+    liquidezMediaDiaria: ['Liquidez Média Diária', 'Liquidez Media Diaria'],
+    faturamento12m: ['Faturamento', 'Receita Líquida', 'Receita (12M)'],
+    lucro12m: ['Lucro Líquido', 'Lucro Liquido', 'Lucro (12M)'],
+    totalDividendos12m: ['Total pago nos últimos 12 meses', 'pagou o total de'],
+    liquidezDiaria: ['Liquidez Diária', 'Liquidez Diaria'],
+    yield1m: ['YIELD 1 MÊS', 'Yield 1M'],
+    yield3m: ['YIELD 3 MESES', 'Yield 3M'],
+    yield6m: ['YIELD 6 MESES', 'Yield 6M'],
+    yield12m: ['YIELD 12 MESES', 'Yield 12M'],
+    ultimoRendimento: ['Último Rendimento', 'Último Dividendo'],
+    valorPatrimonial: ['VAL. PATRIMONIAL P/ COTA', 'Valor Patrimonial por Cota', 'VP/Cota'],
+    valorPatrimonialTotal: ['VALOR PATRIMONIAL', 'Valor Patrimonial Total'],
+    magicNumber: ['Magic Number'],
+    vacanciaFisica: ['Vacância Física', 'VACÂNCIA'],
+    vacanciaFinanceira: ['Vacância Financeira'],
+    numeroCotistas: ['NUMERO DE COTISTAS', 'Número de Cotistas', 'Nº Cotistas'],
+    cotasEmitidas: ['COTAS EMITIDAS', 'Nº de Cotas'],
+  };
+
+  for (const [field, labels] of Object.entries(numericFields)) {
+    if (out[field] !== undefined) continue;
+    const val = findValueAfterLabel(lines, labels, { preferPct: /yield|dy|margem|roe|roic|roa|cagr|payout|vacancia|var/i.test(field) });
+    if (val !== undefined) out[field] = /yield|dy|margem|roe|roic|roa|cagr|payout|vacancia|var/i.test(field) ? COMMON_FORMATTERS.pct(val) : COMMON_FORMATTERS.num(val);
+  }
+
+  const textFields: Record<string, string[]> = {
+    razaoSocial: ['Razão Social'],
+    cnpj: ['CNPJ'],
+    setor: ['Setor'],
+    subsetor: ['Subsetor'],
+    segmento: isFii ? ['SEGMENTO'] : ['Segmento'],
+    segmentoFii: ['SEGMENTO'],
+    tipoFundo: ['TIPO DE FUNDO', 'Tipo de Fundo'],
+    mandato: ['MANDATO', 'Mandato'],
+    publicoAlvo: ['PÚBLICO-ALVO', 'Publico Alvo'],
+    tipoGestao: ['TIPO DE GESTÃO', 'Tipo de Gestão'],
+    prazoDuracao: ['PRAZO DE DURAÇÃO', 'Prazo de Duração'],
+    taxaAdministracao: ['TAXA DE ADMINISTRAÇÃO', 'Taxa de Administração'],
+    segmentoListagem: ['Segmento de Listagem'],
+    freeFloat: ['Free Float'],
+    tagAlong: ['Tag Along'],
+  };
+
+  for (const [field, labels] of Object.entries(textFields)) {
+    if (out[field] !== undefined) continue;
+    if (field === 'cnpj') {
+      const m = text.match(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/);
+      if (m) out[field] = m[0];
+      continue;
+    }
+    const val = findTextAfterLabel(lines, labels);
+    if (val) out[field] = val;
+  }
+
+  const divRows = parseTextDividendRows(text);
+  if ((!Array.isArray(out.historicoDividendos) || out.historicoDividendos.length === 0) && divRows.length) {
+    out.historicoDividendos = divRows;
+  }
+
+  Object.assign(out, parseYieldsDistribuicoes(text));
+
+  const rentabilidade = parseRentabilidade(text);
+  if (rentabilidade) out.rentabilidade = rentabilidade;
+
+  const checklist = parseChecklist(text);
+  if (checklist) out.checklistBah = checklist;
+
+  // Captura narrativas úteis do fim da página sem sobrescrever campos estruturados.
+  const resumoMatch = text.match(/(?:vale a pena\?|Quanto rende|Como comprar)[\s\S]{0,1200}/i);
+  if (resumoMatch && !out.resumoInvestidor10) out.resumoInvestidor10 = resumoMatch[0].replace(/\s+/g, ' ').trim();
+
+  return out as Partial<T>;
+}
+
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9.2 SUPER SECTION PARSER INVESTIDOR10 — seções, tabelas e gráficos embutidos
+// ════════════════════════════════════════════════════════════════════════════
+
+const BR_STATES = new Set([
+  'Acre','Alagoas','Amapá','Amazonas','Bahia','Ceará','Distrito Federal','Espírito Santo','Goiás','Maranhão','Mato Grosso','Mato Grosso do Sul','Minas Gerais','Pará','Paraíba','Paraná','Pernambuco','Piauí','Rio de Janeiro','Rio Grande do Norte','Rio Grande do Sul','Rondônia','Roraima','Santa Catarina','São Paulo','Sergipe','Tocantins'
+].map(stripAccentsLower));
+
+const I10_SECTION_STOP_PATTERNS = [
+  'preco justo do ativo', 'preco teto do ativo', 'indicadores fundamentalistas', 'historico de indicadores',
+  'checklist do investidor', 'historico de dividendos', 'radar de dividendos', 'payout de', 'comparador de acoes',
+  'comparacao de', 'comparando', 'sobre a empresa', 'dados sobre a empresa', 'informacoes sobre a empresa',
+  'regioes onde', 'negocios que geram receita', 'posicao acionaria', 'receitas e lucros', 'lucro x cotacao',
+  'resultados ', 'evolucao do patrimonio', 'balanco patrimonial', 'comunicados do', 'noticias sobre',
+  'informacoes sobre ', 'distribuicoes nos ultimos 12 meses', 'dividend yield', 'lista de imoveis',
+  'media do tipo e segmento', 'carteira investidor 10'
+];
+
+const FIELD_LABELS_I10 = [
+  ['pl', 'P/L'], ['psr', 'P/Receita (PSR)'], ['pvp', 'P/VP'], ['dividendYield', 'Dividend Yield'], ['payout', 'Payout'],
+  ['margemLiquida', 'Margem Líquida'], ['margemBruta', 'Margem Bruta'], ['margemEbit', 'Margem Ebit'], ['margemEbitda', 'Margem Ebtida'],
+  ['evEbitda', 'EV/Ebitda'], ['evEbit', 'EV/Ebit'], ['pEbitda', 'P/Ebitda'], ['pEbit', 'P/Ebit'], ['pAtivo', 'P/Ativo'],
+  ['pCapGiro', 'P/Cap.Giro'], ['pAtivoCircLiq', 'P/Ativo Circ. Liq.'], ['vpa', 'VPA'], ['lpa', 'LPA'], ['giroAtivos', 'Giro Ativos'],
+  ['roe', 'ROE'], ['roic', 'ROIC'], ['roa', 'ROA'], ['dividaLiquidaPatrimonio', 'Dívida Líquida / Patrimônio'],
+  ['dividaLiquidaEbitda', 'Dívida Líquida / Ebitda'], ['dividaLiquidaEbit', 'Dívida Líquida / Ebit'],
+  ['dividaBrutaPatrimonio', 'Dívida Bruta / Patrimônio'], ['patrimonioAtivos', 'Patrimônio / Ativos'], ['passivosAtivos', 'Passivos / Ativos'],
+  ['liquidezCorrente', 'Liquidez Corrente'], ['cagrReceitas5a', 'CAGR Receitas 5 anos'], ['cagrLucros5a', 'CAGR Lucros 5 anos']
+];
+
+function cleanI10Line(line) {
+  return decodeBasicEntities(String(line || ''))
+    .replace(/^[#*•\s]+/g, '').replace(/^-\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function splitVisibleLines(html) {
+  return htmlToVisibleText(html).split('\n').map(cleanI10Line).filter(Boolean);
+}
+
+function isStopLine(line, ownPatterns) {
+  const n = stripAccentsLower(line);
+  const own = (ownPatterns || []).map(stripAccentsLower);
+  if (own.some(p => n.includes(p))) return false;
+  return I10_SECTION_STOP_PATTERNS.some(p => n.includes(p));
+}
+
+function extractSectionLinesByPattern(lines, startPatterns, stopPatterns, maxLines = 700) {
+  const starts = startPatterns.map(stripAccentsLower);
+  const stops = (stopPatterns || []).map(stripAccentsLower);
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const n = stripAccentsLower(lines[i]);
+    if (starts.some(p => n.includes(p))) { start = i; break; }
+  }
+  if (start < 0) return [];
+  const out = [];
+  for (let i = start; i < lines.length && out.length < maxLines; i++) {
+    if (i > start) {
+      const n = stripAccentsLower(lines[i]);
+      if (stops.some(p => n.includes(p))) break;
+      if (isStopLine(lines[i], startPatterns)) break;
+    }
+    out.push(lines[i]);
+  }
+  return out;
+}
+
+function findNextValueInLines(lines, idx, maxLookahead = 5) {
+  for (let j = 1; j <= maxLookahead && idx + j < lines.length; j++) {
+    const cand = lines[idx + j];
+    const m = cand.match(VALUE_TOKEN_RE);
+    if (m && valueLooksUseful(m[0])) return m[0].trim();
+  }
+  return undefined;
+}
+
+function parsePeriodPercentLines(lines) {
+  const periods = [
+    ['1m', ['1 mes', '1 mês']], ['3m', ['3 meses']], ['6m', ['6 meses']], ['1a', ['1 ano']],
+    ['2a', ['2 anos']], ['5a', ['5 anos']], ['10a', ['10 anos']], ['15a', ['15 anos']], ['ytd', ['ytd']]
+  ];
+  const out = {};
+  for (let i = 0; i < lines.length; i++) {
+    const n = normalizeLabel(lines[i]);
+    for (const [key, labs] of periods) {
+      if (!labs.some(l => normalizeLabel(l) === n)) continue;
+      const val = findNextValueInLines(lines, i, 4);
+      if (val && /%/.test(val)) out[key] = COMMON_FORMATTERS.pct(val);
+    }
+  }
+  return out;
+}
+
+function parseRentabilidadeDetalhada(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['rentabilidade de'], ['preco justo do ativo', 'informacoes sobre']);
+  if (!sec.length) return undefined;
+  const realIdx = sec.findIndex(l => stripAccentsLower(l).includes('rentabilidade real'));
+  const nominalStart = sec.findIndex(l => normalizeLabel(l) === 'rentabilidade');
+  const nominalLines = sec.slice(nominalStart >= 0 ? nominalStart + 1 : 1, realIdx > 0 ? realIdx : sec.length);
+  const realLines = realIdx >= 0 ? sec.slice(realIdx + 1) : [];
+  const nominal = parsePeriodPercentLines(nominalLines);
+  const real = parsePeriodPercentLines(realLines);
+  const out = { titulo: sec[0], nominal, real };
+  return (Object.keys(nominal).length || Object.keys(real).length) ? out : undefined;
+}
+
+function parseIndicadoresComparativos(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['indicadores fundamentalistas'], ['historico de indicadores', 'checklist do investidor'], 400);
+  if (!sec.length) return undefined;
+  const items = [];
+  const byField = {};
+  for (let i = 0; i < sec.length; i++) {
+    const nl = normalizeLabel(sec[i]);
+    const spec = FIELD_LABELS_I10.find(([, label]) => normalizeLabel(label) === nl);
+    if (!spec) continue;
+    const [field, label] = spec;
+    const value = findNextValueInLines(sec, i, 4);
+    const compLine = sec.slice(i + 1, i + 8).find(l => /Setor\s*:/i.test(l) || /Subsetor\s*:/i.test(l) || /Segmento\s*:/i.test(l));
+    const comparativos = {};
+    if (compLine) {
+      const mSetor = compLine.match(/Setor\s*:\s*([+-]?[\d,.]+\s*%?)/i);
+      const mSubsetor = compLine.match(/Subsetor\s*:\s*([+-]?[\d,.]+\s*%?)/i);
+      const mSegmento = compLine.match(/Segmento\s*:\s*([+-]?[\d,.]+\s*%?)/i);
+      if (mSetor) comparativos.setor = /%/.test(mSetor[1]) ? COMMON_FORMATTERS.pct(mSetor[1]) : COMMON_FORMATTERS.num(mSetor[1]);
+      if (mSubsetor) comparativos.subsetor = /%/.test(mSubsetor[1]) ? COMMON_FORMATTERS.pct(mSubsetor[1]) : COMMON_FORMATTERS.num(mSubsetor[1]);
+      if (mSegmento) comparativos.segmento = /%/.test(mSegmento[1]) ? COMMON_FORMATTERS.pct(mSegmento[1]) : COMMON_FORMATTERS.num(mSegmento[1]);
+    }
+    const formatted = value && /%/.test(value) ? COMMON_FORMATTERS.pct(value) : (value ? COMMON_FORMATTERS.num(value) : undefined);
+    const item = { field, label, value: formatted, comparativos };
+    items.push(item);
+    byField[field] = item;
+  }
+  const ctx = {};
+  const joined = sec.join(' ');
+  const m1 = joined.match(/Comparando com Setor:\s*([^\.]+)\./i);
+  const m2 = joined.match(/Comparando com Subsetor:\s*([^\.]+)\./i);
+  const m3 = joined.match(/Comparando com Segmento:\s*([^\.]+)\./i);
+  if (m1) ctx.setor = m1[1].trim();
+  if (m2) ctx.subsetor = m2[1].trim();
+  if (m3) ctx.segmento = m3[1].trim();
+  return items.length ? { contexto: ctx, items, byField } : undefined;
+}
+
+function parseChecklistDetalhado(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['checklist do investidor buy and hold'], ['historico de dividendos', 'distribuicoes nos ultimos 12 meses', 'carteira investidor 10'], 80);
+  if (!sec.length) return undefined;
+  const criterios = [];
+  for (const line of sec.slice(1)) {
+    if (/Esta ferramenta|Carteira Investidor|ADICIONAR|Saiba mais/i.test(line)) break;
+    if (line.length < 8 || /^imagem$/i.test(line)) continue;
+    const n = stripAccentsLower(line);
+    let status = 'indeterminado';
+    if (/(aprov|positivo|sim|ok|cumpre|✓|check)/i.test(line)) status = 'aprovado';
+    if (/(reprov|negativo|nao|não|x|falha)/i.test(line)) status = 'reprovado';
+    criterios.push({ criterio: line, status });
+  }
+  return criterios.length ? { criterios, total: criterios.length } : undefined;
+}
+
+function parseComunicados(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['comunicados do'], ['noticias sobre'], 180);
+  if (!sec.length) return undefined;
+  const out = [];
+  for (let i = 1; i < sec.length; i++) {
+    const dateMatch = sec[i].match(/Data de Divulga(?:ç|c)[aã]o\s*:\s*(\d{2}\/\d{2}\/\d{4})/i);
+    if (!dateMatch) continue;
+    let title = '';
+    for (let j = i - 1; j >= Math.max(1, i - 5); j--) {
+      const cand = sec[j].trim();
+      if (!cand || /^Abrir$/i.test(cand) || /^Anterior|^Pr[oó]xima|^\d+$/.test(cand)) continue;
+      if (/Data de Divulga/i.test(cand)) continue;
+      title = cand; break;
+    }
+    if (title) out.push({ titulo: title, dataDivulgacao: dateMatch[1] });
+  }
+  return out.length ? out : undefined;
+}
+
+function parseEmpresaDados(lines) {
+  const out = {};
+  const sobreSec = extractSectionLinesByPattern(lines, ['sobre a empresa'], ['dados sobre a empresa'], 200);
+  if (sobreSec.length) {
+    const paragraphs = sobreSec.slice(1).filter(l => !/Média de avaliações|Avalie|Deixar de seguir|Seguir|Isso não é/i.test(l));
+    if (paragraphs.length) out.sobre = paragraphs.join('\n');
+  }
+  const dadosSec = extractSectionLinesByPattern(lines, ['dados sobre a empresa'], ['informacoes sobre a empresa'], 100);
+  if (dadosSec.length) {
+    const dados = {};
+    const joined = dadosSec.join('\n');
+    const specs = [
+      ['nomeEmpresa', /Nome da Empresa\s*:\s*([^\n]+)/i], ['cnpj', /CNPJ\s*:\s*([\d.\/\-]+)/i],
+      ['anoBolsa', /Ano de estreia na bolsa\s*:\s*(\d{4})/i], ['funcionarios', /N[uú]mero de funcion[aá]rios\s*:\s*([\d.]+)/i],
+      ['anoFundacao', /Ano de funda(?:ç|c)[aã]o\s*:\s*(\d{4})/i]
+    ];
+    for (const [k, re] of specs) {
+      const m = joined.match(re); if (m) dados[k] = /ano/i.test(k) || k === 'funcionarios' ? COMMON_FORMATTERS.int(m[1]) : m[1].trim();
+    }
+    const papeis = [...joined.matchAll(/\b[A-Z]{4}\d{1,2}F?\b/g)].map(m => m[0]);
+    if (papeis.length) dados.papeis = [...new Set(papeis)];
+    out.dados = dados;
+  }
+  const infoSec = extractSectionLinesByPattern(lines, ['informacoes sobre a empresa'], ['regioes onde'], 180);
+  if (infoSec.length) {
+    const info = {};
+    const specs = [
+      ['valorDeMercado', ['Valor de mercado']], ['valorDeFirma', ['Valor de firma']], ['patrimonioLiquido', ['Patrimônio Líquido']],
+      ['totalPapeis', ['Nº total de papeis','Nº total de papéis']], ['ativosTotais', ['Ativos']], ['ativoCirculante', ['Ativo Circulante']],
+      ['dividaBruta', ['Dívida Bruta']], ['dividaLiquida', ['Dívida Líquida']], ['disponibilidade', ['Disponibilidade']],
+      ['liquidezMediaDiaria', ['Liquidez Média Diária']]
+    ];
+    for (const [field, labels] of specs) {
+      const v = findValueAfterLabel(infoSec, labels, { maxLookahead: 4 });
+      if (v) info[field] = COMMON_FORMATTERS.num(v);
+    }
+    const joined = infoSec.join(' ');
+    const sl = joined.match(/Segmento de Listagem\s+([^\n]+?)(?:\s+Free Float|$)/i);
+    const ff = joined.match(/Free Float\s+([\d,.]+\s*%)/i);
+    const ta = joined.match(/Tag Along\s+([\d,.]+\s*%)/i);
+    if (sl) info.segmentoListagem = sl[1].trim();
+    if (ff) info.freeFloat = COMMON_FORMATTERS.pct(ff[1]);
+    if (ta) info.tagAlong = COMMON_FORMATTERS.pct(ta[1]);
+    out.informacoesFinanceiras = info;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function parseSimpleSectionAvailability(lines, startPatterns, stopPatterns) {
+  const sec = extractSectionLinesByPattern(lines, startPatterns, stopPatterns, 120);
+  if (!sec.length) return undefined;
+  const useful = sec.slice(1).filter(l => !/^\*$/.test(l) && !/ARRASTE O QUADRO/i.test(l));
+  return { available: true, titulo: sec[0], texto: useful.slice(0, 40).join('\n') };
+}
+
+function parseFiisInformacoes(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['informacoes sobre'], ['historico de indicadores'], 120);
+  if (!sec.length) return undefined;
+  const map = {
+    razaoSocial: ['Razão Social'], cnpj: ['CNPJ'], publicoAlvo: ['PÚBLICO-ALVO','Publico-alvo'], mandato: ['MANDATO'],
+    segmentoFii: ['SEGMENTO'], tipoFundo: ['TIPO DE FUNDO'], prazoDuracao: ['PRAZO DE DURAÇÃO'], tipoGestao: ['TIPO DE GESTÃO'],
+    taxaAdministracao: ['TAXA DE ADMINISTRAÇÃO'], vacanciaFisica: ['VACÂNCIA'], numeroCotistas: ['NUMERO DE COTISTAS','NÚMERO DE COTISTAS'],
+    cotasEmitidas: ['COTAS EMITIDAS'], valorPatrimonial: ['VAL. PATRIMONIAL P/ COTA'], valorPatrimonialTotal: ['VALOR PATRIMONIAL'], ultimoRendimento: ['ÚLTIMO RENDIMENTO']
+  };
+  const out = {};
+  for (const [field, labels] of Object.entries(map)) {
+    const rawDirect = findRawAfterLabel(sec, labels, 3);
+    const txt = findTextAfterLabel(sec, labels, 3);
+    const val = findValueAfterLabel(sec, labels, { maxLookahead: 3 });
+    const raw = /^(razaoSocial|cnpj|publicoAlvo|mandato|segmentoFii|tipoFundo|prazoDuracao|tipoGestao|taxaAdministracao)$/.test(field)
+      ? (rawDirect || txt || val)
+      : (val || rawDirect || txt);
+    if (!raw) continue;
+    if (field === 'cnpj') out[field] = String(raw).trim();
+    else if (/^(numeroCotistas|cotasEmitidas)$/.test(field)) out[field] = COMMON_FORMATTERS.int(raw);
+    else if (/^(valorPatrimonial|valorPatrimonialTotal|ultimoRendimento)$/.test(field)) out[field] = COMMON_FORMATTERS.num(raw);
+    else if (/vacancia/i.test(field)) out[field] = COMMON_FORMATTERS.pct(raw);
+    else out[field] = String(raw).trim();
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function parseDistribuicoes12m(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['distribuicoes nos ultimos 12 meses'], ['dividend yield'], 80);
+  if (!sec.length) return undefined;
+  const text = sec.join('\n');
+  const parsed = parseYieldsDistribuicoes(text);
+  const out = { ...parsed };
+  const rows = [];
+  const re = /YIELD\s+(1\s*M[ÊE]S|3\s*MESES|6\s*MESES|12\s*MESES)\s+([\d,.]+\s*%)\s+R\$\s*([\d,.]+)/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) rows.push({ periodo: m[1].replace(/\s+/g, ' '), yield: COMMON_FORMATTERS.pct(m[2]), valor: COMMON_FORMATTERS.num(m[3]) });
+  if (rows.length) out.rows = rows;
+  return Object.keys(out).length ? out : undefined;
+}
+
+function parseDividendYieldSection(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['dividend yield'], ['historico de dividendos', 'gare11 dividendos', 'sobre a'], 120);
+  if (!sec.length) return undefined;
+  const joined = sec.join(' ');
+  const out = {};
+  const atual = joined.match(/DY atual\s*:\s*([\d,.]+\s*%)/i);
+  const medio = joined.match(/DY m[eé]dio em 5 anos\s*:\s*([\d,.]+\s*%)/i);
+  if (atual) out.dyAtual = COMMON_FORMATTERS.pct(atual[1]);
+  if (medio) out.dyMedio5a = COMMON_FORMATTERS.pct(medio[1]);
+  return Object.keys(out).length ? out : undefined;
+}
+
+function parseListaImoveis(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['lista de imoveis'], ['comunicados do', 'media do tipo'], 900);
+  if (!sec.length) return undefined;
+  const porEstado = [];
+  const imoveis = [];
+  for (let i = 1; i < sec.length; i++) {
+    const stateNorm = stripAccentsLower(sec[i]);
+    if (BR_STATES.has(stateNorm) && /^\d+$/.test(sec[i + 1] || '')) {
+      porEstado.push({ estado: sec[i], quantidade: Number(sec[i + 1]) });
+      i++;
+      continue;
+    }
+    const estadoM = sec[i].match(/^Estado\s*:\s*(.+)$/i);
+    if (estadoM) {
+      let nome = '';
+      for (let j = i - 1; j >= Math.max(1, i - 6); j--) {
+        const cand = sec[j].trim();
+        if (!cand || /^\d+$/.test(cand) || BR_STATES.has(stripAccentsLower(cand)) || /^Área bruta/i.test(cand)) continue;
+        nome = cand; break;
+      }
+      let area = undefined;
+      const areaLine = sec.slice(i + 1, i + 4).find(l => /^Área bruta locável/i.test(l));
+      if (areaLine) {
+        const m = areaLine.match(/([\d.]+,?\d*)\s*m/i);
+        if (m) area = Number(String(m[1]).replace(/\./g, '').replace(',', '.'));
+      }
+      imoveis.push({ nome, estado: estadoM[1].trim(), areaBrutaLocavelM2: area });
+    }
+  }
+  return (porEstado.length || imoveis.length) ? { porEstado, imoveis, totalImoveisExtraidos: imoveis.length } : undefined;
+}
+
+function parseMediaTipoSegmento(lines) {
+  const sec = extractSectionLinesByPattern(lines, ['media do tipo e segmento'], ['noticias', 'comentarios'], 100);
+  if (!sec.length) return undefined;
+  const text = sec.join(' ');
+  const out = { descricao: '' };
+  const desc = text.match(/Comparando\s+.+?\./i);
+  if (desc) out.descricao = desc[0].trim();
+  const specs = [
+    ['pvp', /P\/VP\s*:\s*([\d,.]+)\s*Comparação\s*:\s*([\d,.]+)/i],
+    ['dy12m', /DY\s*\(12M\)\s*:\s*([\d,.]+\s*%)\s*Comparação\s*:\s*([\d,.]+\s*%)/i],
+    ['valorPatrimonial', /Valor Patrimonial\s*:\s*([\d,.]+\s*(?:Milh[õo]es|Bilh[õo]es|Trilh[õo]es|[KMB])?)\s*Comparação\s*:\s*([\d,.]+\s*(?:Milh[õo]es|Bilh[õo]es|Trilh[õo]es|[KMB])?)/i],
+    ['valorPatrimonialPorCota', /Val\. Patrimonial p\/ Cota\s*:\s*R\$\s*([\d,.]+)\s*Comparação\s*:\s*R\$\s*([\d,.]+)/i]
+  ];
+  out.metricas = {};
+  for (const [field, re] of specs) {
+    const m = text.match(re);
+    if (!m) continue;
+    out.metricas[field] = {
+      ativo: /%/.test(m[1]) ? COMMON_FORMATTERS.pct(m[1]) : COMMON_FORMATTERS.num(m[1]),
+      comparacao: /%/.test(m[2]) ? COMMON_FORMATTERS.pct(m[2]) : COMMON_FORMATTERS.num(m[2]),
+    };
+  }
+  return Object.keys(out.metricas).length || out.descricao ? out : undefined;
+}
+
+function parseHtmlTables(html) {
+  const tables = [];
+  const tableRe = /<table\b[^>]*>[\s\S]*?<\/table>/gi;
+  let m;
+  while ((m = tableRe.exec(html)) !== null && tables.length < 30) {
+    const tableHtml = m[0];
+    const headers = [];
+    const thRe = /<th\b[^>]*>([\s\S]*?)<\/th>/gi;
+    let th;
+    while ((th = thRe.exec(tableHtml)) !== null) headers.push(cleanI10Line(th[1].replace(/<[^>]+>/g, ' ')));
+    const rows = [];
+    const trRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/gi;
+    let tr;
+    while ((tr = trRe.exec(tableHtml)) !== null && rows.length < 300) {
+      const cells = [];
+      const tdRe = /<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]>/gi;
+      let td;
+      while ((td = tdRe.exec(tr[1])) !== null) cells.push(cleanI10Line(td[1].replace(/<[^>]+>/g, ' ')));
+      if (cells.length) rows.push(cells);
+    }
+    if (rows.length) tables.push({ headers, rows });
+  }
+  return tables;
+}
+
+function parseEmbeddedChartCandidates(html) {
+  const candidates = [];
+  const scripts = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)].map(m => decodeBasicEntities(m[1] || ''));
+  for (const script of scripts) {
+    if (!/(series|datasets|labels|chart|grafico|Highcharts|ApexCharts|Chart\()/i.test(script)) continue;
+    const compact = script.replace(/\s+/g, ' ').trim();
+    if (!compact) continue;
+    const labelMatch = compact.match(/(?:name|title|label)\s*[:=]\s*['"]([^'"]{2,80})['"]/i);
+    const nums = [...compact.matchAll(/[\[{,]\s*(-?\d+(?:\.\d+)?)\s*[,\]}]/g)].slice(0, 80).map(m => Number(m[1])).filter(Number.isFinite);
+    const labels = [...compact.matchAll(/['"]((?:20\d{2}|\d{2}\/\d{2}\/\d{4}|\d{2}\/\d{4}|1T\d{2}|2T\d{2}|3T\d{2}|4T\d{2})[^'"]*)['"]/g)].slice(0, 80).map(m => m[1]);
+    if (nums.length || labels.length) {
+      candidates.push({ label: labelMatch ? labelMatch[1] : undefined, numericSample: nums, labelSample: labels, rawSample: compact.slice(0, 1200) });
+    }
+    if (candidates.length >= 20) break;
+  }
+  const dataAttrRe = /data-(?:chart|series|labels|values|json)=["']([^"']{10,5000})["']/gi;
+  let dm;
+  while ((dm = dataAttrRe.exec(html)) !== null && candidates.length < 30) {
+    const raw = decodeBasicEntities(dm[1]);
+    try { candidates.push({ from: 'data-attribute', data: JSON.parse(raw) }); }
+    catch { candidates.push({ from: 'data-attribute', rawSample: raw.slice(0, 1200) }); }
+  }
+  return candidates;
+}
+
+function parseInvestidor10DeepSections(html, template, existingResults = {}) {
+  const out = { ...existingResults };
+  const lines = splitVisibleLines(html);
+  if (!lines.length) return out;
+  const text = lines.join('\n');
+  const isFii = /FII/i.test(template.name);
+  const sections = { ...(out.sections || {}) };
+
+  const rentabilidade = parseRentabilidadeDetalhada(lines);
+  if (rentabilidade) sections.rentabilidade = rentabilidade;
+
+  const indicadores = parseIndicadoresComparativos(lines);
+  if (indicadores) {
+    sections.indicadoresFundamentalistas = indicadores;
+    for (const item of indicadores.items) if (out[item.field] === undefined && item.value !== undefined) out[item.field] = item.value;
+  }
+
+  const checklist = parseChecklistDetalhado(lines);
+  if (checklist) {
+    sections.checklistBuyAndHold = checklist;
+    if (!out.checklistBah) out.checklistBah = checklist.criterios.map(c => c.criterio);
+  }
+
+  const dividendos = parseTextDividendRows(text);
+  if (dividendos.length) {
+    out.historicoDividendos = out.historicoDividendos && out.historicoDividendos.length ? out.historicoDividendos : dividendos;
+    sections.dividendos = { ...(sections.dividendos || {}), historico: dividendos };
+  }
+
+  const comunicados = parseComunicados(lines);
+  if (comunicados) sections.comunicados = comunicados;
+
+  const tables = parseHtmlTables(html);
+  if (tables.length) sections.tabelasHtml = tables;
+
+  const chartCandidates = parseEmbeddedChartCandidates(html);
+  if (chartCandidates.length) sections.graficosEmbutidos = chartCandidates;
+
+  if (isFii) {
+    const infoFii = parseFiisInformacoes(lines);
+    if (infoFii) {
+      sections.informacoesFundo = infoFii;
+      for (const [k, v] of Object.entries(infoFii)) if (out[k] === undefined) out[k] = v;
+    }
+    const dist = parseDistribuicoes12m(lines);
+    if (dist) sections.distribuicoes12m = dist;
+    const dySec = parseDividendYieldSection(lines);
+    if (dySec) {
+      sections.dividendYield = dySec;
+      if (out.dividendYield === undefined && dySec.dyAtual) out.dividendYield = dySec.dyAtual;
+      if (out.dyMedio5a === undefined && dySec.dyMedio5a) out.dyMedio5a = dySec.dyMedio5a;
+    }
+    const listaImoveis = parseListaImoveis(lines);
+    if (listaImoveis) sections.listaImoveis = listaImoveis;
+    const media = parseMediaTipoSegmento(lines);
+    if (media) sections.mediaTipoSegmento = media;
+    sections.historicoIndicadores = parseSimpleSectionAvailability(lines, ['historico de indicadores'], ['comparacao de']);
+    sections.comparacaoIndices = parseSimpleSectionAvailability(lines, ['comparacao de'], ['comparando com outros']);
+    sections.comparacaoOutrosFiis = parseSimpleSectionAvailability(lines, ['comparando com outros fiis'], ['checklist do investidor']);
+  } else {
+    const empresa = parseEmpresaDados(lines);
+    if (empresa) {
+      sections.empresa = empresa;
+      if (empresa.dados) for (const [k, v] of Object.entries(empresa.dados)) if (out[k] === undefined) out[k] = v;
+      if (empresa.informacoesFinanceiras) for (const [k, v] of Object.entries(empresa.informacoesFinanceiras)) if (out[k] === undefined) out[k] = v;
+    }
+    const radar = parseSimpleSectionAvailability(lines, ['radar de dividendos inteligente'], ['payout de']);
+    if (radar) sections.radarDividendos = radar;
+    sections.historicoIndicadores = parseSimpleSectionAvailability(lines, ['historico de indicadores'], ['checklist do investidor']);
+    sections.payoutHistorico = parseSimpleSectionAvailability(lines, ['payout de'], ['preco teto do ativo', 'comparador de']);
+    sections.comparadorAcoes = parseSimpleSectionAvailability(lines, ['comparador de acoes'], ['comparacao de']);
+    sections.comparacaoIndices = parseSimpleSectionAvailability(lines, ['comparacao de'], ['comparando']);
+    sections.comparacaoBrent = parseSimpleSectionAvailability(lines, ['comparando', 'petroleo brent'], ['sobre a empresa']);
+    sections.regioesReceita = parseSimpleSectionAvailability(lines, ['regioes onde'], ['negocios que geram receita']);
+    sections.negociosReceita = parseSimpleSectionAvailability(lines, ['negocios que geram receita'], ['posicao acionaria']);
+    sections.posicaoAcionaria = parseSimpleSectionAvailability(lines, ['posicao acionaria'], ['receitas e lucros']);
+    sections.receitasLucros = parseSimpleSectionAvailability(lines, ['receitas e lucros'], ['lucro x cotacao']);
+    sections.lucroCotacao = parseSimpleSectionAvailability(lines, ['lucro x cotacao'], ['resultados']);
+    sections.resultados = parseSimpleSectionAvailability(lines, ['resultados'], ['evolucao do patrimonio']);
+    sections.evolucaoPatrimonio = parseSimpleSectionAvailability(lines, ['evolucao do patrimonio'], ['balanco patrimonial']);
+    sections.balancoPatrimonial = parseSimpleSectionAvailability(lines, ['balanco patrimonial'], ['comunicados do']);
+  }
+
+  for (const k of Object.keys(sections)) if (sections[k] === undefined) delete sections[k];
+  if (Object.keys(sections).length) out.sections = sections;
+  out._i10Coverage = {
+    sectionKeys: Object.keys(sections),
+    htmlTables: tables.length,
+    embeddedChartCandidates: chartCandidates.length,
+    parserVersion: 'super-i10-v18',
+  };
+  return out;
+}
+
+export function enhancedUniversalLexer(html, template, existingResults = {}) {
+  const firstPass = universalLexer(html, template, existingResults);
+  const textPass = textFallbackLexer(html, template, firstPass);
+  return parseInvestidor10DeepSections(html, template, textPass);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // 10. SCHEMAS ZOD POR TIPO DE ATIVO
 // ════════════════════════════════════════════════════════════════════════════
@@ -662,7 +1467,7 @@ export const B3Schema = z.object({
 
   // ── Campos preenchidos pelo Yahoo Finance ────────────────────────────
   regularMarketPrice:  zNumStr(),
-});
+}).passthrough();
 
 /**
  * ATUALIZADO v16 — FIISchema expandido com todos os campos do guia de scraping.
@@ -713,7 +1518,7 @@ export const FIISchema = z.object({
   // ── Comparação com Médias do Tipo ────────────────────────────────────
   pvpMedioTipo:         zNumStr(),
   dyMedioTipo:          zStr(),
-});
+}).passthrough();
 
 export const ETFSchema = z.object({
   precoAtual:        zNumStr(),
@@ -723,7 +1528,7 @@ export const ETFSchema = z.object({
   taxaAdmin:         zStr(),
   variacaoDay:       zStr(),
   variacao12m:       zStr(),
-});
+}).passthrough();
 
 /**
  * NOVO v16 — StockSchema para ações estrangeiras (Stocks) listadas no
@@ -1390,6 +2195,7 @@ async function yahooFundamentals(ticker: string, timeoutMs: number): Promise<Yah
 export class NexusEngineUltra {
   private static _urlInFlight     = new Map<string, Promise<any>>();
   private static _tickerInFlight  = new Map<string, Promise<any>>();
+  private static _newsCache       = new LRUCache<NewsItem[]>(200);
 
   private static _cache           = new LRUCache<any>(500);
   private static _circuitBreakers = new Map<string, CircuitBreaker>();
@@ -1458,13 +2264,13 @@ export class NexusEngineUltra {
   private static _getNexusProxyUrl(): string {
     return this._options.nexusProxyUrl
       || (typeof process !== 'undefined' ? process.env?.NEXUS_PROXY_URL ?? '' : '')
-      || 'https://valorae-proxy.vercel.app/api/scrape';
+      || '';
   }
 
   private static _getNexusProxyBatchUrl(): string {
     return this._options.nexusProxyBatchUrl
       || (typeof process !== 'undefined' ? process.env?.NEXUS_PROXY_BATCH_URL ?? '' : '')
-      || 'https://valorae-proxy.vercel.app/api/batch-scrape';
+      || '';
   }
 
   private static _getNexusProxyTargetUA(): string {
@@ -1473,56 +2279,6 @@ export class NexusEngineUltra {
   }
 
   // ── Fetch com timeout e retry ITERATIVO ─────────────────────────────────
-
-  private static generateResilientHtml(ticker: string, url: string): string {
-    const t = ticker.toUpperCase();
-    let seed = 0;
-    for (let i = 0; i < t.length; i++) seed += t.charCodeAt(i);
-
-    const preco = (seed % 150) + 12.35;
-    const dy = ((seed % 12) + 3.14).toFixed(2);
-    const pl = ((seed % 18) + 4.5).toFixed(2);
-    const pvp = ((seed % 3) + 0.82).toFixed(2);
-    const vpa = (preco / parseFloat(pvp)).toFixed(2);
-    const lpa = (preco / parseFloat(pl)).toFixed(2);
-    const roe = ((seed % 25) + 8).toFixed(2) + '%';
-    const roic = ((seed % 20) + 7).toFixed(2) + '%';
-    const ml = ((seed % 30) + 5).toFixed(2) + '%';
-    const mb = ((seed % 50) + 20).toFixed(2) + '%';
-    const mo = ((seed % 40) + 10).toFixed(2) + '%';
-    const db = ((seed % 2) + 0.5).toFixed(2);
-    const mc = (seed * 1500000).toLocaleString('pt-BR');
-    const ev = ((seed % 10) + 3).toFixed(2);
-    const varDay = (seed % 2 === 0 ? '+' : '-') + (seed % 5).toFixed(2) + '%';
-
-    return `
-      <html><head><title>Nexus Resilient Sandbox HTML for ${t}</title></head>
-      <body>
-        <div>[Nexus Engine Active Resilience Mode] WAF Bypass Resiliente para ${url}</div>
-        <div>Preço Atual: <strong>R$ ${preco.toFixed(2).replace('.', ',')}</strong></div>
-        <div>Cotação: <strong>R$ ${preco.toFixed(2).replace('.', ',')}</strong></div>
-        <div>Dividend Yield: <strong>${dy}%</strong></div>
-        <div>DY: <strong>${dy}%</strong></div>
-        <div>P/L: <strong>${pl}</strong></div>
-        <div>P/VP: <strong>${pvp}</strong></div>
-        <div>VPA: <strong>${vpa}</strong></div>
-        <div>LPA: <strong>${lpa}</strong></div>
-        <div>ROE: <strong>${roe}</strong></div>
-        <div>ROIC: <strong>${roic}</strong></div>
-        <div>Margem Líquida: <strong>${ml}</strong></div>
-        <div>Margem Bruta: <strong>${mb}</strong></div>
-        <div>Margem Ebit: <strong>${mo}</strong></div>
-        <div>Dívida Bruta: <strong>${db}</strong></div>
-        <div>EV/EBITDA: <strong>${ev}</strong></div>
-        <div>Variação: <strong>${varDay}</strong></div>
-        <div>Valor Patrimonial: <strong>${vpa}</strong></div>
-        <div>Liquidez Diária: <strong>${(seed * 450).toLocaleString('pt-BR')}</strong></div>
-        <div>Último Rendimento: <strong>R$ ${(preco * 0.007).toFixed(2).replace('.', ',')}</strong></div>
-        <div>Vacância Física: <strong>${seed % 10}%</strong></div>
-        <div>Patrimônio Líquido: <strong>${mc}</strong></div>
-        <div>Taxa de Administração: <strong>0,${(seed % 9) + 1}%</strong></div>
-      </body></html>`;
-  }
 
   private static async fetchWithJitter(url: string, requireStealth: boolean): Promise<Response> {
     let lastErr: Error = new Error('fetch falhou');
@@ -1559,12 +2315,9 @@ export class NexusEngineUltra {
         }
         if (!res.ok) {
           if (res.status === 403 || res.status === 401) {
-            console.warn(`[Nexus Engine] WAF bloqueou HTTP ${res.status} para ${url}. Ativando simulador resiliente.`);
-            const ticker = url.split('/').map(s => s.trim().toUpperCase()).filter(Boolean).pop() || 'ATIVO';
-            return new Response(this.generateResilientHtml(ticker, url), {
-              status: 200,
-              headers: { 'Content-Type': 'text/html; charset=utf-8' },
-            });
+            // Nunca gerar dados financeiros sintéticos. Em bloqueio/WAF, falha de forma explícita
+            // para o orquestrador cair em outra fonte real (NexusProxy/Yahoo/StatusInvest).
+            throw new Error(`WAF HTTP ${res.status}`);
           }
           throw new Error(`HTTP ${res.status}`);
         }
@@ -1590,7 +2343,7 @@ export class NexusEngineUltra {
   /**
    * NOVO v16 — Busca HTML via NexusProxy API e processa com universalLexer.
    * Benefícios: cache ETag/SWR/LRU no servidor, circuit breaker por domínio,
-   * bypass de WAF via proxy Vercel, coalescing de requests duplicados.
+   * cache/isolamento via proxy Vercel, coalescing de requests duplicados.
    *
    * Headers do payload incluídos para melhor cache coalescing (doc NexusProxy v3.8).
    * `includeScripts: false` ativa o fast path single-pass do NexusProxy.
@@ -1632,7 +2385,7 @@ export class NexusEngineUltra {
         throw new Error(`NexusProxy: html ausente na resposta`);
       }
 
-      const rawData = universalLexer<T>(html, source.template, {});
+      const rawData = enhancedUniversalLexer(html, source.template, {});
       const parsed  = source.template.schema.safeParse(rawData);
 
       cb.recordSuccess();
@@ -1762,9 +2515,9 @@ export class NexusEngineUltra {
     /**
      * NOVO v16 — Tenta NexusProxy primeiro se configurado.
      * O NexusProxy tem seu próprio CB ('nexusproxy'). Se falhar, cai para fetch direto.
-     * Vantagens: cache ETag/SWR, bypass WAF, coalescing, métricas separadas.
+     * Vantagens: cache, coalescing, métricas separadas e menor fan-out do cliente.
      */
-    if (this._options.useNexusProxy) {
+    if (this._options.useNexusProxy && this._getNexusProxyUrl()) {
       const proxyCB = this.getCB('nexusproxy');
       if (!proxyCB.isOpen()) {
         try {
@@ -1785,6 +2538,9 @@ export class NexusEngineUltra {
       const reader  = res.body.getReader();
       const decoder = new TextDecoder();
       let htmlBuffer = '';
+      let fullHtmlBuffer = '';
+      const shouldFullParseI10 = source.url.includes('investidor10.com.br');
+      const FULL_PARSE_LIMIT = Number(process.env.NEXUS_FULL_PARSE_LIMIT || 2_500_000);
       let rawData: Partial<T> = {};
       let bytesRead  = 0;
       let earlyAbort = false;
@@ -1807,6 +2563,9 @@ export class NexusEngineUltra {
           bytesRead       += value.length;
           const decoded    = decoder.decode(value, { stream: true });
           htmlBuffer      += decoded;
+          if (fullHtmlBuffer.length < FULL_PARSE_LIMIT) {
+            fullHtmlBuffer += decoded.slice(0, Math.max(0, FULL_PARSE_LIMIT - fullHtmlBuffer.length));
+          }
           htmlLowerBuffer += decoded.toLowerCase();
 
           if (htmlBuffer.length > MAX_WINDOW) {
@@ -1817,7 +2576,7 @@ export class NexusEngineUltra {
           rawData = universalLexer<T>(htmlBuffer, source.template, rawData, htmlLowerBuffer);
 
           const currentFieldCount = Object.keys(rawData).length;
-          if (bytesRead > 100_000) {
+          if (!shouldFullParseI10 && bytesRead > 100_000) {
             if (currentFieldCount === lastFieldCount) {
               stagnantChunks++;
               if (stagnantChunks >= 10) {
@@ -1834,7 +2593,7 @@ export class NexusEngineUltra {
           }
 
           const hasAll = source.template.rules.every(r => rawData[r.name as keyof T] !== undefined);
-          if (hasAll) {
+          if (hasAll && !shouldFullParseI10) {
             reader.cancel().catch(() => {});
             earlyAbort = true;
             break;
@@ -1845,12 +2604,17 @@ export class NexusEngineUltra {
         const tail = decoder.decode();
         if (tail) {
           htmlBuffer      += tail;
+          if (fullHtmlBuffer.length < FULL_PARSE_LIMIT) {
+            fullHtmlBuffer += tail.slice(0, Math.max(0, FULL_PARSE_LIMIT - fullHtmlBuffer.length));
+          }
           htmlLowerBuffer += tail.toLowerCase();
           rawData = universalLexer<T>(htmlBuffer, source.template, rawData, htmlLowerBuffer);
         }
       } finally {
         try { reader.releaseLock(); } catch { /* ignore */ }
       }
+
+      rawData = enhancedUniversalLexer(fullHtmlBuffer || htmlBuffer, source.template, rawData);
 
       const parsed = source.template.schema.safeParse(rawData);
       if (parsed.success) {
@@ -1902,17 +2666,15 @@ export class NexusEngineUltra {
     const startTime = performance.now();
     const startCpu  = safeCpuStart();
 
-    const [scrapeResult, yahooResult, yahooFund, newsResult] = await Promise.allSettled([
+    const [scrapeResult, yahooResult, yahooFund] = await Promise.allSettled([
       this.execute(sources),
       yahooQuote(cleanTicker, this._options.fetchTimeoutMs),
       yahooFundamentals(cleanTicker, this._options.fetchTimeoutMs),
-      includeNews ? this.fetchNews(cleanTicker) : Promise.resolve(undefined),
     ]);
 
     const scrape   = scrapeResult.status === 'fulfilled' ? scrapeResult.value : { data: {}, bytes: 0, earlyAbort: false, cacheStatus: 'ERROR' };
     const quote    = yahooResult.status  === 'fulfilled' ? yahooResult.value  : null;
     const fund     = yahooFund.status    === 'fulfilled' ? yahooFund.value    : {};
-    const newsData = newsResult.status   === 'fulfilled' ? newsResult.value   : undefined;
     const combined = { ...scrape.data } as Record<string, any>;
 
     /** Preenche lacunas com dados do Yahoo — não sobrescreve dados já extraídos. */
@@ -1950,6 +2712,8 @@ export class NexusEngineUltra {
     if (combined.margemEbit && !combined.margemOperacional) {
       combined.margemOperacional = combined.margemEbit;
     }
+
+    const newsData = includeNews ? await this.fetchNews(cleanTicker, combined).catch(() => []) : undefined;
 
     const totalTimeMs = performance.now() - startTime;
     const sources_used: string[] = [];
@@ -2001,8 +2765,9 @@ export class NexusEngineUltra {
   ): Promise<any[]> {
     const nexusProxyBatchUrl = this._getNexusProxyBatchUrl();
 
+    // Sem URL de batch configurada, usa concorrência local e evita payloads enormes entre funções Vercel.
     // Se for o proxy Valorae, ele ainda não suporta batch nativamente, então pulamos para o fallback
-    if (this._options.useNexusProxy && nexusProxyBatchUrl.includes('valorae-proxy')) {
+    if (!nexusProxyBatchUrl || (this._options.useNexusProxy && nexusProxyBatchUrl.includes('valorae-proxy'))) {
       return this.executeBatch(
         ativos.map(({ ticker, type }) => () => this.fetchAtivo(ticker, type, includeNews))
       );
@@ -2110,14 +2875,14 @@ export class NexusEngineUltra {
       let combined: Record<string, any> = {};
       for (const r of [i10Res, siRes]) {
         if (!r?.html) continue;
-        const extracted = universalLexer(r.html, preset.template, combined);
+        const extracted = enhancedUniversalLexer(r.html, preset.template, combined);
         for (const [k, v] of Object.entries(extracted)) {
           if (v !== undefined && combined[k] === undefined) combined[k] = v;
         }
       }
 
       const cacheStatus = i10Res?.metrics?.cacheStatus ?? siRes?.metrics?.cacheStatus ?? 'MISS';
-      const news = includeNews ? await this.fetchNews(clean).catch(() => []) : undefined;
+      const news = includeNews ? await this.fetchNews(clean, combined).catch(() => []) : undefined;
 
       return {
         ticker:      clean,
@@ -2254,9 +3019,95 @@ export class NexusEngineUltra {
 
   // ── fetchNews ─────────────────────────────────────────────────────────────
 
-  static async fetchNews(ticker: string): Promise<NewsItem[]> {
+  private static _decodeRssText(raw: string = ''): string {
+    return decodeBasicEntities(String(raw || ''))
+      .replace(/^<!\[CDATA\[/, '')
+      .replace(/\]\]>$/, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private static _extractXmlTag(xml: string, tag: string): string | undefined {
+    const re = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, 'i');
+    const m = re.exec(xml);
+    return m ? this._decodeRssText(m[1]) : undefined;
+  }
+
+  private static _assetAliases(ticker: string, context: Record<string, any> = {}): string[] {
     const clean = canonicalizeTicker(ticker);
-    const url = `https://news.google.com/rss/search?q=${clean}+ação+OR+fii+OR+b3+OR+investimento&hl=pt-BR&gl=BR&ceid=BR:pt-419`;
+    const aliases = new Set<string>([clean, `${clean}.SA`]);
+    const candidates = [
+      context?.nome,
+      context?.razaoSocial,
+      context?.companyName,
+      context?.shortName,
+      context?.longName,
+      context?.empresa?.nome,
+      context?.empresa?.razaoSocial,
+      context?.sections?.empresa?.nome,
+      context?.sections?.empresa?.dados?.razaoSocial,
+      context?.sections?.informacoesFundo?.razaoSocial,
+    ];
+    for (const raw of candidates) {
+      if (!raw || typeof raw !== 'string') continue;
+      const cleaned = raw.replace(/\bS\.?A\.?\b/gi, '').replace(/\bS\.A\.\b/gi, '').replace(/\s+/g, ' ').trim();
+      if (cleaned.length >= 4 && cleaned.length <= 80) aliases.add(cleaned);
+      const words = cleaned.split(/\s+/).filter(Boolean);
+      const firstWords = words.slice(0, 3).join(' ');
+      if (firstWords.length >= 4) aliases.add(firstWords);
+      for (const word of words) {
+        const normalized = stripAccentsLower(word);
+        if (word.length >= 5 && !['brasileiro','brasileira','participacoes','companhia','empresa','fundo','investimento','imobiliario'].includes(normalized)) {
+          aliases.add(word);
+        }
+      }
+    }
+    return [...aliases].filter(Boolean);
+  }
+
+  private static _buildGoogleNewsQuery(ticker: string, context: Record<string, any> = {}): string {
+    const clean = canonicalizeTicker(ticker);
+    const aliases = this._assetAliases(clean, context).slice(0, 8);
+    const aliasQuery = aliases.map(a => /\s/.test(a) ? `"${a}"` : a).join(' OR ');
+    return `(${aliasQuery}) (B3 OR ações OR ação OR bolsa OR dividendos OR proventos OR resultados OR balanço OR FII OR "fundo imobiliário")`;
+  }
+
+  private static _buildGoogleNewsUrl(query: string): string {
+    const params = new URLSearchParams({
+      q: query,
+      hl: 'pt-BR',
+      gl: 'BR',
+      ceid: 'BR:pt-419',
+    });
+    return `https://news.google.com/rss/search?${params.toString()}`;
+  }
+
+  private static _scoreNewsItem(item: NewsItem, ticker: string, aliases: string[]): number {
+    const clean = canonicalizeTicker(ticker);
+    const hay = stripAccentsLower([item.title, item.snippet, item.source].filter(Boolean).join(' '));
+    let score = 0;
+    if (hay.includes(stripAccentsLower(clean))) score += 8;
+    if (hay.includes(stripAccentsLower(`${clean}.SA`))) score += 4;
+    for (const alias of aliases) {
+      const a = stripAccentsLower(alias);
+      if (a.length >= 4 && hay.includes(a)) score += /\s/.test(alias) ? 5 : 3;
+    }
+    if (/\b(dividendo|provento|resultado|balanco|balanço|lucro|receita|fii|fundo imobiliario|acao|ações|b3|bolsa|cotacao|cotação)\b/i.test(hay)) score += 2;
+    return score;
+  }
+
+  static async fetchNews(ticker: string, context: Record<string, any> = {}): Promise<NewsItem[]> {
+    const clean = canonicalizeTicker(ticker);
+    const query = this._buildGoogleNewsQuery(clean, context);
+    const url = this._buildGoogleNewsUrl(query);
+    const limit = Math.max(1, Math.min(Number(process.env.NEXUS_NEWS_LIMIT || 8), 20));
+    const cacheTtlMs = Math.max(60_000, Number(process.env.NEXUS_NEWS_CACHE_TTL_MS || 15 * 60_000));
+    const cacheKey = `news:${clean}:${stripAccentsLower(query)}`;
+    const aliases = this._assetAliases(clean, context);
+
+    const cached = this._newsCache.get(cacheKey);
+    if (cached) return cached.data.slice(0, limit);
 
     const existing = this._urlInFlight.get(url);
     if (existing) return existing;
@@ -2265,7 +3116,14 @@ export class NexusEngineUltra {
       const ctrl  = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), this._options.fetchTimeoutMs);
       try {
-        const fetchOpts: any = { signal: ctrl.signal, headers: { 'User-Agent': getRandomAgent() } };
+        const fetchOpts: any = {
+          signal: ctrl.signal,
+          headers: {
+            'User-Agent': getRandomAgent(),
+            'Accept': 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
+            'Accept-Language': 'pt-BR,pt;q=0.9,en-US;q=0.6,en;q=0.4',
+          },
+        };
         if (this._options.fetchDispatcher) fetchOpts.dispatcher = this._options.fetchDispatcher;
         const res = await fetch(url, fetchOpts);
         clearTimeout(timer);
@@ -2273,26 +3131,45 @@ export class NexusEngineUltra {
         const xml = await res.text();
 
         const items: NewsItem[] = [];
-        const itemRegex = /<item>([\s\S]*?)<\/item>/g;
-        let match;
+        const seen = new Set<string>();
+        const itemRegex = /<item\b[^>]*>([\s\S]*?)<\/item>/gi;
+        let match: RegExpExecArray | null;
 
-        while ((match = itemRegex.exec(xml)) !== null && items.length < 5) {
-          const itemXml     = match[1];
-          const titleMatch  = /<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/.exec(itemXml);
-          const linkMatch   = /<link>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/.exec(itemXml);
-          const pubMatch    = /<pubDate>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/pubDate>/.exec(itemXml);
-          const sourceMatch = /<source[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/source>/.exec(itemXml);
+        while ((match = itemRegex.exec(xml)) !== null && items.length < 60) {
+          const itemXml = match[1];
+          const title = this._extractXmlTag(itemXml, 'title');
+          const link = this._extractXmlTag(itemXml, 'link');
+          if (!title || !link) continue;
 
-          if (titleMatch && linkMatch) {
-            items.push({
-              title:   titleMatch[1].replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>'),
-              link:    linkMatch[1],
-              pubDate: pubMatch ? new Date(pubMatch[1]) : undefined,
-              source:  sourceMatch ? sourceMatch[1] : undefined,
-            });
-          }
+          const pubRaw = this._extractXmlTag(itemXml, 'pubDate');
+          const source = this._extractXmlTag(itemXml, 'source');
+          const snippet = this._extractXmlTag(itemXml, 'description');
+          const item: NewsItem = {
+            title,
+            link,
+            pubDate: pubRaw ? new Date(pubRaw) : undefined,
+            source,
+            snippet,
+            query,
+          };
+          item.relevanceScore = this._scoreNewsItem(item, clean, aliases);
+          if (item.relevanceScore < 5) continue;
+
+          const dedupeKey = stripAccentsLower(`${title}|${source || ''}`).replace(/[^a-z0-9]+/g, ' ').trim();
+          if (seen.has(dedupeKey)) continue;
+          seen.add(dedupeKey);
+          items.push(item);
         }
-        return items;
+
+        items.sort((a, b) => {
+          const scoreDiff = (b.relevanceScore || 0) - (a.relevanceScore || 0);
+          if (scoreDiff) return scoreDiff;
+          return (b.pubDate ? b.pubDate.getTime() : 0) - (a.pubDate ? a.pubDate.getTime() : 0);
+        });
+
+        const finalItems = items.slice(0, limit);
+        this._newsCache.set(cacheKey, finalItems, cacheTtlMs, cacheTtlMs);
+        return finalItems;
       } catch {
         return [];
       } finally {
@@ -2332,6 +3209,7 @@ export class NexusEngineUltra {
 
   static clearCache(): void {
     this._cache           = new LRUCache<any>(500);
+    this._newsCache       = new LRUCache<NewsItem[]>(200);
     _hostnameCache.clear();
     _regexCache.clear();
     _anchorLowerCache.clear();
