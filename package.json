@@ -1,13 +1,24 @@
 {
   "name": "valorae-proxy",
-  "version": "20.1.0",
-  "description": "Servidor proxy Valorae para scraping público de ações e FIIs com schema oficial, quality score, debug mode, testes dourados e melhorias inspiradas no Scraper 4.",
+  "version": "21.5.13",
+  "description": "Valorae Proxy v21.5.13 mature final release free-only: revisão final minuciosa com fieldWarnings, scrapeUrl exato, admin/query hardening, rate-limit efetivo e maturidade de lançamento sem dependências externas.",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node -e \"const fs=require('fs');fs.mkdirSync('public',{recursive:true});if(!fs.existsSync('public/index.html'))fs.writeFileSync('public/index.html','<h1>Valorae Proxy</h1>');\"",
-    "check": "node --check api/asset.js && node --check api/assets.js && node --check api/scrape.js && node --check api/batch-scrape.js && node --check api/news.js && node --check api/health.js && node --check api/sync.js && node --check api/index.js && node --check api/lib/Valorae-engine.js && node --check api/lib/normalizers/financial.js && node --check api/lib/quality/schema.js && node --check test/golden.test.js",
-    "test": "node test/golden.test.js"
+    "build": "node scripts/build-free.js",
+    "check": "node -e \"const fs=require('fs'),path=require('path');const roots=['api','routes','lib','test','scripts'];const files=[];function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name);if(e.isDirectory())walk(p);else if(p.endsWith('.js'))files.push(p)}}roots.forEach(r=>fs.existsSync(r)&&walk(r));const cp=require('child_process');for(const f of files){cp.execFileSync(process.execPath,['--check',f],{stdio:'inherit'})}console.log('Checked '+files.length+' JS files')\"",
+    "test": "node test/golden.test.js && node test/routes-audit.test.js && node test/scraper-gap.test.js && node test/scraper-supremacy.test.js && node test/v21-5-professional-refinement.test.js && node test/v21-5-1-audit-hardening.test.js && node test/v21-5-2-router-contract.test.js && node test/v21-5-3-scraper-compat-hardening.test.js && node test/v21-5-4-audit-corrections.test.js && node test/v21-5-5-complete-audit-hardening.test.js && node test/v21-5-6-final-review-hardening.test.js && node test/v21-5-7-contract-safety-hardening.test.js && node test/v21-5-8-portfolio-tech-supremacy.test.js && node test/v21-5-9-source-reliability-portfolio.test.js && node test/v21-5-10-launch-readiness.test.js && node test/v21-5-11-final-minute-audit.test.js && node test/v21-5-12-quality-matrix-portfolio-confidence.test.js && node test/v21-5-13-mature-final-release.test.js",
+    "audit:functions": "node scripts/audit-functions.js",
+    "audit:free": "node scripts/preflight-free-only.js",
+    "smoke": "node scripts/smoke-test.js",
+    "audit:version": "node scripts/audit-version-consistency.js",
+    "audit:routes": "node scripts/audit-route-contract.js",
+    "typecheck": "node scripts/typecheck-free.js",
+    "verify": "node scripts/verify-release.js",
+    "audit:release": "node scripts/audit-release-readiness.js",
+    "audit:minutiae": "node scripts/audit-minutiae.js",
+    "audit:recommended": "node scripts/audit-recommended-improvements.js",
+    "audit:final": "node scripts/audit-final-maturity.js"
   },
   "engines": {
     "node": ">=20.0.0"

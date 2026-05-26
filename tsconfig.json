@@ -7,7 +7,16 @@
     "checkJs": false,
     "noEmit": true,
     "skipLibCheck": true,
-    "strict": false
+    "strict": false,
+    "resolveJsonModule": true
   },
-  "include": ["api/**/*.js"]
+  "include": [
+    "api/**/*.js",
+    "routes/**/*.js",
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "lib/**/*.ts",
+    "public/sdk/typescript/**/*.ts"
+  ],
+  "exclude": ["node_modules", ".vercel"]
 }

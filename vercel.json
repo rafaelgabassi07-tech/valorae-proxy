@@ -3,19 +3,19 @@
   "outputDirectory": "public",
   "headers": [
     {
-      "source": "/api/(.*)",
+      "source": "/(.*)",
       "headers": [
         {
-          "key": "Access-Control-Allow-Origin",
-          "value": "*"
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
         },
         {
-          "key": "Access-Control-Allow-Methods",
-          "value": "GET,POST,OPTIONS"
+          "key": "Referrer-Policy",
+          "value": "no-referrer"
         },
         {
-          "key": "Access-Control-Allow-Headers",
-          "value": "Content-Type, X-Requested-With"
+          "key": "Permissions-Policy",
+          "value": "geolocation=(), microphone=(), camera=()"
         }
       ]
     }
