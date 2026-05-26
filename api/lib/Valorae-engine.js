@@ -2,7 +2,7 @@
 // Motor novo do Valorae Proxy para Vercel/GitHub.
 // Foco: dados públicos de ações/FIIs, diagnóstico claro, sem dados sintéticos.
 
-export const VALORAE_ENGINE_VERSION = '19.2.0-self-contained-valorae-scrape';
+export const VALORAE_ENGINE_VERSION = '19.5.0-import-path-fix';
 
 const DEFAULT_TIMEOUT_MS = intEnv('VALORAE_FETCH_TIMEOUT_MS', 12000);
 const DEFAULT_MAX_HTML_CHARS = intEnv('VALORAE_MAX_HTML_CHARS', 3_200_000);
