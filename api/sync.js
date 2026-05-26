@@ -1,115 +1,57 @@
-/**
- * Vercel Serverless Function: Secure Supabase Sync Proxy (Bridge)
- * Save this file as /api/sync.js in your Vercel project root folder.
- * 
- * Securely communicates with Supabase from Vercel servers, 
- * keeping your private Supabase credentials (URL, Key) confidential.
- */
+// Ponte opcional Vercel -> Supabase. Mantém credenciais privadas no servidor.
+
+function cors(req, res) {
+  const origin = process.env.CORS_ALLOW_ORIGIN || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  if (origin !== '*') res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS, POST');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With, X-CSRF-Token');
+}
 
 export default async function handler(req, res) {
-  // CORS Configuration
-  const corsOrigin = process.env.CORS_ALLOW_ORIGIN || '*';
-  res.setHeader('Access-Control-Allow-Origin', corsOrigin);
-  if (corsOrigin !== '*') res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
-  );
-
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
+  cors(req, res);
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   const supabaseUrl = process.env.SUPABASE_URL;
   const supabaseKey = process.env.SUPABASE_ANON_KEY;
-
   if (!supabaseUrl || !supabaseKey) {
-    return res.status(500).json({ 
-      error: "O Vercel não possui as variáveis de ambiente SUPABASE_URL ou SUPABASE_ANON_KEY configuradas no Dashboard." 
-    });
+    return res.status(500).json({ error: 'SUPABASE_URL ou SUPABASE_ANON_KEY ausente no Vercel.' });
   }
 
-  const cleanSupabaseUrl = supabaseUrl.replace(/\/$/, '');
+  const base = supabaseUrl.replace(/\/$/, '');
+  const headers = { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` };
 
-  // 1. GET Request: Handles healthcheck / restore
   if (req.method === 'GET') {
-    const { user_id } = req.query || {};
-
+    const { user_id } = req.query;
     if (!user_id) {
-      // Act as health check / proxy ping
       try {
-        const testRes = await fetch(`${cleanSupabaseUrl}/rest/v1/`, {
-          headers: {
-            'apikey': supabaseKey,
-            'Authorization': `Bearer ${supabaseKey}`
-          }
-        });
-        
-        if (testRes.ok || testRes.status === 404) {
-          return res.status(200).json({ status: "online", message: "Ponte Vercel -> Supabase ativa e respondendo!" });
-        } else {
-          return res.status(502).json({ error: "Supabase inacessível", details: testRes.statusText });
-        }
+        const test = await fetch(`${base}/rest/v1/`, { headers });
+        return res.status(test.ok || test.status === 404 ? 200 : 502).json({ ok: test.ok || test.status === 404, status: test.status });
       } catch (err) {
-        return res.status(500).json({ error: "Erro ao testar conexão ao Supabase", details: err.message });
+        return res.status(500).json({ error: 'Erro ao testar Supabase.', details: err?.message });
       }
     }
-
-    // Restore Backup logic: Query Supabase safely using server-side variables
     try {
-      const fetchUrl = `${cleanSupabaseUrl}/rest/v1/valorae_sync_backups?user_id=eq.${encodeURIComponent(user_id)}`;
-      const response = await fetch(fetchUrl, {
-        method: 'GET',
-        headers: {
-          'apikey': supabaseKey,
-          'Authorization': `Bearer ${supabaseKey}`
-        }
-      });
-
-      if (!response.ok) {
-        return res.status(response.status).json({ error: `Erro ao consultar Supabase: ${response.statusText}` });
-      }
-
-      const data = await response.json();
-      return res.status(200).json(data);
+      const url = `${base}/rest/v1/valorae_sync_backups?user_id=eq.${encodeURIComponent(user_id)}`;
+      const response = await fetch(url, { headers });
+      const text = await response.text();
+      return res.status(response.status).send(text);
     } catch (err) {
-      return res.status(500).json({ error: "Falha de rede na ponte do serverless", details: err.message });
+      return res.status(500).json({ error: 'Falha ao consultar Supabase.', details: err?.message });
     }
   }
 
-  // 2. POST Request: Backup upload (Upsert)
   if (req.method === 'POST') {
     try {
-      const payload = req.body;
-      if (!payload || typeof payload !== 'object') {
-        return res.status(400).json({ error: 'Payload JSON inválido ou ausente.' });
-      }
-      
-      const response = await fetch(`${cleanSupabaseUrl}/rest/v1/valorae_sync_backups`, {
+      const response = await fetch(`${base}/rest/v1/valorae_sync_backups`, {
         method: 'POST',
-        headers: {
-          'apikey': supabaseKey,
-          'Authorization': `Bearer ${supabaseKey}`,
-          'Content-Type': 'application/json',
-          'Prefer': 'resolution=merge-duplicates,return=representation'
-        },
-        body: JSON.stringify(payload)
+        headers: { ...headers, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=representation' },
+        body: JSON.stringify(req.body || {}),
       });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        return res.status(response.status).json({ 
-          error: `Erro ao fazer upsert no Supabase: ${response.statusText}`, 
-          details: errorText 
-        });
-      }
-
-      const result = await response.json();
-      return res.status(200).json({ success: true, count: result.length, data: result });
+      const text = await response.text();
+      return res.status(response.status).send(text);
     } catch (err) {
-      return res.status(500).json({ error: "Falha de rede ao salvar backup", details: err.message });
+      return res.status(500).json({ error: 'Falha ao salvar no Supabase.', details: err?.message });
     }
   }
 

@@ -1,101 +1,76 @@
-import { NexusEngineUltra, inferAssetType, canonicalizeTicker, validarTicker } from './lib/nexus-engine.js';
+import { ValoraeEngine, canonicalizeTicker, validarTicker } from '../lib/Valorae-engine.js';
 
-function truthy(v) {
-  return v === true || v === 'true' || v === '1' || v === 'yes' || v === 'sim' || v === 'on';
+const MAX_TICKERS = Number(process.env.MAX_TICKERS_PER_REQUEST || 20);
+
+function cors(req, res) {
+  const origin = process.env.CORS_ALLOW_ORIGIN || '*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With');
+  res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=300');
 }
 
-function numberEnv(name, fallback, { min, max } = {}) {
-  const raw = process.env?.[name];
-  const n = raw == null || raw === '' ? fallback : Number(raw);
-  const safe = Number.isFinite(n) ? n : fallback;
-  return Math.min(max ?? safe, Math.max(min ?? safe, safe));
+function boolParam(v) {
+  return ['1', 'true', 'yes', 'sim', 'on'].includes(String(v || '').toLowerCase());
 }
 
-function setCors(res, methods = 'GET, POST, OPTIONS') {
-  res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ALLOW_ORIGIN || '*');
-  res.setHeader('Access-Control-Allow-Methods', methods);
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Cache-Version, Authorization');
+function getBaseUrl(req) {
+  const explicit = process.env.VALORAE_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL;
+  if (explicit) return explicit.replace(/\/$/, '');
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${proto}://${host}`.replace(/\/$/, '');
 }
 
-function getRequestBaseUrl(req) {
-  const protoHeader = req.headers?.['x-forwarded-proto'];
-  const hostHeader = req.headers?.['x-forwarded-host'] || req.headers?.host;
-  const proto = Array.isArray(protoHeader) ? protoHeader[0] : (protoHeader || 'https');
-  const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
-  return host ? `${proto}://${host}` : '';
+function parseTickers(input) {
+  if (Array.isArray(input)) return input;
+  if (typeof input === 'string') return input.split(',');
+  return [];
 }
-
-function configureEngine(req) {
-  const baseUrl = getRequestBaseUrl(req);
-  const useInternalProxy = truthy(process.env.NEXUS_USE_INTERNAL_PROXY);
-  NexusEngineUltra.configure({
-    useNexusProxy: useInternalProxy,
-    nexusProxyUrl: process.env.NEXUS_PROXY_URL || (useInternalProxy && baseUrl ? `${baseUrl}/api/scrape` : ''),
-    nexusProxyBatchUrl: process.env.NEXUS_PROXY_BATCH_URL || '',
-    fetchTimeoutMs: numberEnv('FETCH_TIMEOUT_MS', 15_000, { min: 3000, max: 55_000 }),
-    nexusProxyTimeoutMs: numberEnv('NEXUS_PROXY_TIMEOUT_MS', 12_000, { min: 3000, max: 55_000 }),
-    concurrencyLimit: numberEnv('NEXUS_CONCURRENCY_LIMIT', 5, { min: 1, max: 10 }),
-    domainRps: numberEnv('NEXUS_DOMAIN_RPS', 2, { min: 0.2, max: 10 }),
-    domainBurst: numberEnv('NEXUS_DOMAIN_BURST', 5, { min: 1, max: 20 }),
-  });
-}
-
-const MAX_TICKERS = numberEnv('MAX_TICKERS_PER_REQUEST', 20, { min: 1, max: 50 });
 
 export default async function handler(req, res) {
-  setCors(res, 'GET, POST, OPTIONS');
+  cors(req, res);
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'GET' && req.method !== 'POST') {
-    res.setHeader('Allow', 'GET, POST, OPTIONS');
-    return res.status(405).json({ error: 'Método não permitido. Use GET ou POST.' });
-  }
-
-  configureEngine(req);
+  if (!['GET', 'POST'].includes(req.method)) return res.status(405).json({ error: 'Método não permitido. Use GET ou POST.' });
 
   const input = req.method === 'GET' ? req.query : (req.body || {});
-  let rawTickers = [];
+  const raw = parseTickers(input.tickers || input.ticker).map(t => String(t).trim()).filter(Boolean);
 
-  if (req.method === 'GET') {
-    const param = input.tickers || input.ticker || '';
-    rawTickers = String(param).split(',').map(t => t.trim()).filter(Boolean);
-  } else if (Array.isArray(input?.tickers)) {
-    rawTickers = input.tickers;
-  } else if (typeof input?.tickers === 'string') {
-    rawTickers = input.tickers.split(',').map(t => t.trim()).filter(Boolean);
-  }
-
-  if (rawTickers.length === 0) {
+  if (!raw.length) {
     return res.status(400).json({
+      version: ValoraeEngine.version,
       error: 'Envie ao menos um ticker.',
-      hint: 'GET /api/assets?tickers=PETR4,VISC11 ou POST { "tickers": ["PETR4", "VISC11"] }',
+      hint: 'GET /api/assets?tickers=PETR4,GARE11 ou POST { "tickers": ["PETR4", "GARE11"] }',
     });
   }
-
-  if (rawTickers.length > MAX_TICKERS) {
-    return res.status(400).json({ error: `Máximo de ${MAX_TICKERS} tickers por requisição. Enviados: ${rawTickers.length}.` });
+  if (raw.length > MAX_TICKERS) {
+    return res.status(400).json({ version: ValoraeEngine.version, error: `Máximo de ${MAX_TICKERS} tickers por requisição.` });
   }
 
   const valid = [];
   const errors = [];
-  for (const raw of rawTickers) {
-    const clean = canonicalizeTicker(String(raw));
-    const erro = validarTicker(clean);
-    if (erro) errors.push({ ticker: raw, error: erro });
-    else valid.push({ ticker: clean, type: inferAssetType(clean) });
+  for (const r of raw) {
+    const t = canonicalizeTicker(r);
+    const err = validarTicker(t);
+    if (err) errors.push({ ticker: r, error: err });
+    else valid.push(t);
   }
 
-  const includeNews = truthy(input.includeNews) || truthy(input.news);
-  let assets = [];
+  const batch = await ValoraeEngine.fetchAtivosBatch(valid, {
+    mode: input.mode || 'super',
+    includeNews: boolParam(input.includeNews || input.news),
+    newsLimit: Number(input.newsLimit || input.limit || 8),
+    useYahooFallback: input.yahoo === undefined ? true : boolParam(input.yahoo),
+    concurrency: Number(input.concurrency || process.env.VALORAE_BATCH_CONCURRENCY || 4),
+    timeoutMs: Number(input.timeoutMs || process.env.VALORAE_FETCH_TIMEOUT_MS || 12000),
+    maxHtmlChars: Number(input.maxHtmlChars || process.env.VALORAE_MAX_HTML_CHARS || 3200000),
+    valoraeScrapeUrl: input.scrapeUrl || `${getBaseUrl(req)}/api/scrape`,
+  });
 
-  if (valid.length > 0) {
-    const results = await NexusEngineUltra.fetchAtivosBatch(valid, includeNews);
-    for (let i = 0; i < results.length; i++) {
-      const out = results[i];
-      if (out instanceof Error) errors.push({ ticker: valid[i].ticker, error: out.message });
-      else if (out?.metrics?.error && out.cacheStatus === 'ERROR') errors.push({ ticker: valid[i].ticker, error: out.metrics.error });
-      else assets.push(out);
-    }
-  }
-
-  return res.status(200).json({ count: assets.length, assets, errors: errors.length ? errors : undefined });
+  return res.status(200).json({
+    version: ValoraeEngine.version,
+    count: batch.assets.length,
+    assets: batch.assets,
+    errors: [...errors, ...batch.errors],
+  });
 }
