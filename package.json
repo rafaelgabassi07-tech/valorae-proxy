@@ -1,6 +1,6 @@
 {
   "name": "nexus-proxy",
-  "version": "1.8.3",
+  "version": "1.8.4",
   "description": "Proxy serverless para scraping B3 (Investidor10 / StatusInvest / Google News) compatível com Vercel",
   "private": true,
   "type": "module",
