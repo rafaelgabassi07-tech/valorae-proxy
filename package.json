@@ -1,12 +1,12 @@
 {
   "name": "valorae-proxy",
-  "version": "19.4.0",
+  "version": "19.5.0",
   "description": "Servidor proxy Valorae para scraping público de ações e FIIs com Valorae-engine e ValoraeScrape próprio. Vercel auto-detect functions.",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node -e \"const fs=require('fs');fs.mkdirSync('public',{recursive:true});if(!fs.existsSync('public/index.html'))fs.writeFileSync('public/index.html','<h1>Valorae Proxy</h1>');\"",
-    "check": "node --check api/asset.js && node --check api/assets.js && node --check api/scrape.js && node --check api/batch-scrape.js && node --check api/news.js && node --check api/health.js && node --check api/sync.js && node --check api/index.js && node --check api/_lib/Valorae-engine.js"
+    "check": "node --check api/asset.js && node --check api/assets.js && node --check api/scrape.js && node --check api/batch-scrape.js && node --check api/news.js && node --check api/health.js && node --check api/sync.js && node --check api/index.js && node --check api/lib/Valorae-engine.js"
   },
   "engines": {
     "node": ">=20.0.0"

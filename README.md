@@ -1,6 +1,6 @@
-# Valorae Proxy v19.2
+# Valorae Proxy v19.5
 
-Servidor proxy self-contained para GitHub + Vercel, com motor `api/_lib/Valorae-engine.js` e scraper próprio `api/scrape.js`.
+Servidor proxy self-contained para GitHub + Vercel, com motor `api/lib/Valorae-engine.js` e scraper próprio `api/scrape.js`.
 
 ## Estrutura
 
@@ -14,8 +14,7 @@ api/
   health.js
   index.js
   sync.js
-api/
-  _lib/
+  lib/
     Valorae-engine.js
 public/
   index.html
