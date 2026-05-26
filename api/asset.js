@@ -69,6 +69,7 @@ export default async function handler(req, res) {
     const type = input.type || inferAssetType(clean);
     const includeNews = truthy(input.includeNews) || truthy(input.news);
     const result = await NexusEngineUltra.fetchAtivo(clean, type, includeNews);
+    if (result?.version) res.setHeader('X-Nexus-Version', result.version);
     return res.status(200).json(result);
   } catch (error) {
     return res.status(500).json({ error: 'Erro ao processar ativo: ' + (error?.message || String(error)) });
