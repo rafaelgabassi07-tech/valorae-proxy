@@ -1,1 +1,7 @@
-
+export type ValoraeAssetType = 'ACAO' | 'FII' | 'ETF' | 'BDR' | string;
+export type ValoraeStatus = 'OK' | 'PARTIAL' | 'ERROR' | string;
+export interface ValoraeFinancialField { display?: string; value?: number | null; unit?: string; source?: string; confidence?: number; }
+export interface ValoraeAssetPayload { version: string; schemaVersion?: string; status: ValoraeStatus; partial?: boolean; ticker: string; type: ValoraeAssetType; results?: Record<string, unknown>; normalized?: Record<string, ValoraeFinancialField | unknown>; parserResilience?: Record<string, unknown>; schemaStability?: Record<string, unknown>; quality?: Record<string, unknown>; errors?: unknown[]; }
+export interface ValoraeFetchOptions { mode?: string; view?: string; profile?: string; includeNews?: boolean; nocache?: boolean; cache?: boolean; fields?: string; dataFields?: string; lean?: boolean; maxItems?: number; }
+export interface ValoraePortfolioPosition { ticker: string; quantity?: number; averagePrice?: number; currentPrice?: number; currentValue?: number; investedValue?: number; targetPercent?: number; type?: string; annualRatePercent?: number; indexer?: string; liquidityDays?: number; maturityDate?: string; issuer?: string; currency?: string; riskLevel?: string; taxExempt?: boolean; objective?: string; account?: string; tags?: string[]; }
+export interface ValoraePortfolioIntelligence { incomeCalendar?: Record<string, unknown>; incomeCoverage?: Record<string, unknown>; liquidity?: unknown[]; goalProjection?: Record<string, unknown>; dataCompleteness?: Record<string, unknown>; taxPlanner?: Record<string, unknown>; technologyReadiness?: Record<string, unknown>; actionPlan?: unknown[]; }
