@@ -2175,7 +2175,11 @@ export class NexusEngineUltra {
                         .then(fresh => this._cache.set(cacheKey, fresh, this._options.cacheStaleMs, this._options.cacheTtlMs))
                         .catch(() => { });
                     this._tickerInFlight.set(cacheKey, bg);
-                    bg.finally(() => this._tickerInFlight.delete(cacheKey));
+                    // Evita unhandled rejection em Node/Vercel: não usar .finally() sem observar a Promise retornada.
+                    bg.then(
+                        () => this._tickerInFlight.delete(cacheKey),
+                        () => this._tickerInFlight.delete(cacheKey),
+                    );
                 }
                 return { ...cached.data, cacheStatus: 'STALE' };
             }
@@ -2191,7 +2195,12 @@ export class NexusEngineUltra {
             return { ...fresh, cacheStatus: 'MISS' };
         });
         this._tickerInFlight.set(cacheKey, p);
-        p.finally(() => this._tickerInFlight.delete(cacheKey));
+        // Importante no Vercel/Node 20+: .finally() cria uma nova Promise que rejeita se não for observada.
+        // Em bloqueios 401/403 do WAF, isso derrubava a função com "Unhandled Rejection".
+        p.then(
+            () => this._tickerInFlight.delete(cacheKey),
+            () => this._tickerInFlight.delete(cacheKey),
+        );
         return p;
     }
     // ── _executeNetwork: orquestra fontes sequencialmente ───────────────────
@@ -2215,7 +2224,12 @@ export class NexusEngineUltra {
                     this._totalRequests++;
                     fetchPromise = this._streamAndParse(source, cb);
                     this._urlInFlight.set(source.url, fetchPromise);
-                    fetchPromise.finally(() => this._urlInFlight.delete(source.url));
+                    // Não usar .finally() solto: se _streamAndParse rejeitar (ex.: WAF HTTP 403),
+                    // Node 20 no Vercel pode tratar a Promise retornada por finally como unhandled.
+                    fetchPromise.then(
+                        () => this._urlInFlight.delete(source.url),
+                        () => this._urlInFlight.delete(source.url),
+                    );
                 }
                 const result = await fetchPromise;
                 // Acumula o melhor resultado parcial de múltiplas fontes
@@ -2385,6 +2399,9 @@ export class NexusEngineUltra {
             yahooQuote(cleanTicker, this._options.fetchTimeoutMs),
             yahooFundamentals(cleanTicker, this._options.fetchTimeoutMs),
         ]);
+        const scrapeError = scrapeResult.status === 'rejected'
+            ? (scrapeResult.reason?.message || String(scrapeResult.reason || 'Erro desconhecido no scraper'))
+            : undefined;
         const scrape = scrapeResult.status === 'fulfilled' ? scrapeResult.value : { data: {}, bytes: 0, earlyAbort: false, cacheStatus: 'ERROR' };
         const quote = yahooResult.status === 'fulfilled' ? yahooResult.value : null;
         const fund = yahooFund.status === 'fulfilled' ? yahooFund.value : {};
@@ -2451,6 +2468,7 @@ export class NexusEngineUltra {
                 source: sources_used.join(' + ') || 'None',
                 cpuUsageMs: safeCpuDeltaMs(startCpu),
                 estimatedMemoryMb: Number((scrape.bytes / 1024 / 1024).toFixed(2)),
+                ...(scrapeError ? { scrapeError } : {}),
             },
         };
     }
