@@ -35,6 +35,17 @@ const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
 ];
 const YAHOO_HOSTS = ['query1', 'query2'];
+const ENGINE_VERSION = '18.7.0-diagnostics';
+
+function envFlag(name, fallback = false) {
+    try {
+        const v = typeof process !== 'undefined' ? process.env?.[name] : undefined;
+        if (v == null || v === '') return fallback;
+        return ['1', 'true', 'yes', 'sim', 'on'].includes(String(v).toLowerCase());
+    } catch {
+        return fallback;
+    }
+}
 /**
  * ATUALIZADO v16 — ETFs B3 conhecidos, incluindo fundos lançados até 2026.
  */
@@ -1951,6 +1962,10 @@ async function yahooQuote(ticker, timeoutMs) {
     }
 }
 async function yahooFundamentals(ticker, timeoutMs) {
+    // O endpoint quoteSummary do Yahoo frequentemente retorna 401 no ambiente Vercel.
+    // Ele era apenas uma fonte secundária e deixava logs confusos. Mantemos desativado
+    // por padrão; ative com NEXUS_ENABLE_YAHOO_FUNDAMENTALS=1 se quiser testar.
+    if (!envFlag('NEXUS_ENABLE_YAHOO_FUNDAMENTALS', false)) return {};
     const isStock = /^[A-Z]{1,5}$/.test(ticker);
     const symbols = isStock ? [ticker] : [`${ticker}.SA`, ticker.toUpperCase()];
     const modules = 'financialData,defaultKeyStatistics';
@@ -2453,19 +2468,43 @@ export class NexusEngineUltra {
             sources_used.push('YahooFinance');
         if (Object.keys(fund ?? {}).length)
             sources_used.push('YahooFundamentals');
+
+        const scrapeFoundKeys = Object.keys(scrape.data || {});
+        const foundKeys = Object.keys(combined);
+        const fallbackOnly = scrapeFoundKeys.length === 0 && foundKeys.length > 0;
+        const warnings = [];
+        if (scrapeError) {
+            warnings.push(`Scraping HTML indisponível ou bloqueado: ${scrapeError}`);
+        }
+        if (fallbackOnly && quote) {
+            warnings.push('Retorno parcial: somente cotação/preço via Yahoo Finance; HTML do Investidor10/StatusInvest não foi processado.');
+        }
+        if (!foundKeys.length) {
+            warnings.push('Nenhuma fonte retornou dados úteis para este ticker.');
+        }
+        const responseStatus = warnings.length ? 'PARTIAL' : 'OK';
         return {
+            version: ENGINE_VERSION,
+            status: responseStatus,
+            partial: warnings.length > 0,
             ticker: cleanTicker,
             type,
             results: combined,
-            cacheStatus: scrape.cacheStatus || 'MISS',
+            cacheStatus: scrape.cacheStatus || (fallbackOnly ? 'PARTIAL' : 'MISS'),
+            ...(warnings.length ? { warnings } : {}),
             ...(newsData ? { news: newsData } : {}),
             metrics: {
+                engineVersion: ENGINE_VERSION,
                 totalTimeMs,
                 bytesProcessed: scrape.bytes,
-                foundKeys: Object.keys(combined),
-                successRate: Object.keys(combined).length / preset.template.rules.length,
+                htmlBytesProcessed: scrape.bytes,
+                scrapeFoundKeys,
+                foundKeys,
+                successRate: foundKeys.length / preset.template.rules.length,
                 earlyAbort: scrape.earlyAbort,
                 source: sources_used.join(' + ') || 'None',
+                fallbackOnly,
+                scrapeStatus: scrapeFoundKeys.length > 0 ? 'OK' : 'NO_HTML_DATA',
                 cpuUsageMs: safeCpuDeltaMs(startCpu),
                 estimatedMemoryMb: Number((scrape.bytes / 1024 / 1024).toFixed(2)),
                 ...(scrapeError ? { scrapeError } : {}),
