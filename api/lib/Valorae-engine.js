@@ -2,13 +2,15 @@
 // Motor novo do Valorae Proxy para Vercel/GitHub.
 // Foco: dados públicos de ações/FIIs, diagnóstico claro, sem dados sintéticos.
 
-export const VALORAE_ENGINE_VERSION = '19.5.0-import-path-fix';
+export const VALORAE_ENGINE_VERSION = '19.6.0-super-parser';
 
 const DEFAULT_TIMEOUT_MS = intEnv('VALORAE_FETCH_TIMEOUT_MS', 12000);
 const DEFAULT_MAX_HTML_CHARS = intEnv('VALORAE_MAX_HTML_CHARS', 3_200_000);
 const DEFAULT_NEWS_LIMIT = intEnv('VALORAE_NEWS_LIMIT', 8);
 const NEWS_CACHE_TTL_MS = intEnv('VALORAE_NEWS_CACHE_TTL_MS', 15 * 60 * 1000);
 const HTML_CACHE_TTL_MS = intEnv('VALORAE_HTML_CACHE_TTL_MS', 2 * 60 * 1000);
+const ENABLE_INVESTIDOR10_INTERNAL_APIS = boolEnv('VALORAE_ENABLE_INTERNAL_APIS', true);
+const USE_YAHOO_FOR_CURRENT_QUOTE = boolEnv('VALORAE_USE_YAHOO_FOR_CURRENT_QUOTE', true);
 
 // Camada ValoraeScrape self-contained.
 // Em produção, /api/asset chama o próprio /api/scrape do mesmo domínio,
@@ -897,11 +899,16 @@ function extractImoveis(text, tables) {
 function extractGenericSectionData(text, tables) {
   const headings = {
     rentabilidade: ['Rentabilidade'],
+    indicadores: ['INDICADORES', 'Indicadores'],
     historicoIndicadores: ['Histórico de Indicadores', 'HISTÓRICO DE INDICADORES'],
+    checklistBah: ['Checklist do investidor buy and hold', 'CHECKLIST DO INVESTIDOR BUY AND HOLD'],
     radarDividendos: ['RADAR DE DIVIDENDOS', 'Radar de Dividendos'],
-    comparacaoIndices: ['COMPARAÇÃO', 'Comparação com Índices', 'COMPARAÇÃO DE'],
+    comparadorAcoes: ['COMPARADOR DE AÇÕES', 'Comparador de Ações'],
     comparador: ['COMPARADOR', 'Comparador'],
-    sobre: ['SOBRE A EMPRESA', 'SOBRE A', 'Sobre a empresa'],
+    comparacaoIndices: ['COMPARAÇÃO DE', 'Comparação com Índices', 'COMPARAÇÃO COM ÍNDICES'],
+    comparacaoFiis: ['COMPARANDO COM OUTROS FIIS', 'Comparando com outros FIIs', 'Outros FIIs'],
+    comparacaoCommodity: ['Petróleo Brent', 'Brent'],
+    sobre: ['SOBRE A EMPRESA', 'SOBRE O FUNDO', 'SOBRE A', 'Sobre a empresa', 'Sobre o fundo'],
     dadosEmpresa: ['DADOS SOBRE A EMPRESA', 'Dados sobre a empresa'],
     informacoesEmpresa: ['INFORMAÇÕES SOBRE A EMPRESA', 'Informações sobre a empresa'],
     regioesReceita: ['Regiões onde', 'Regiões onde gera receita'],
@@ -912,6 +919,8 @@ function extractGenericSectionData(text, tables) {
     resultados: ['Resultados'],
     evolucaoPatrimonio: ['EVOLUÇÃO DO PATRIMÔNIO', 'Evolução do Patrimônio'],
     balancoPatrimonial: ['BALANÇO PATRIMONIAL', 'Balanço Patrimonial'],
+    distribuicoes12m: ['Distribuições nos últimos 12 meses', 'Distribuicoes nos ultimos 12 meses'],
+    dividendYieldSecao: ['DIVIDEND YIELD', 'Dividend Yield'],
     valorPatrimonial: ['Informações sobre valor patrimonial', 'Valor Patrimonial'],
     mediaTipoSegmento: ['Média do Tipo e Segmento', 'Média do Tipo', 'Média do Segmento'],
   };
@@ -979,6 +988,277 @@ function detectChartKind(text) {
 }
 
 
+function cleanAboutCandidate(text = '') {
+  const compact = stripTags(text).replace(/\s+/g, ' ').trim();
+  if (compact.length < 80) return '';
+  if (/Preço Justo|Graham|Bazin|Radar de Dividendos|Calculadora|Comparador de/i.test(compact)) return '';
+  if (/Publicado em|ADICIONAR NA CARTEIRA|Saiba mais/i.test(compact) && compact.length < 500) return '';
+  return compact.slice(0, 4500);
+}
+
+function extractMetaDescription(html = '') {
+  const source = String(html || '');
+  const meta = source.match(/<meta\b[^>]*(?:name|property)=["'](?:description|og:description)["'][^>]*content=["']([^"']+)["']/i)?.[1] ||
+               source.match(/<meta\b[^>]*content=["']([^"']+)["'][^>]*(?:name|property)=["'](?:description|og:description)["']/i)?.[1];
+  return meta ? decodeHtml(meta).replace(/\s+/g, ' ').trim() : '';
+}
+
+function extractJsonLdDescriptions(html = '') {
+  const out = [];
+  const re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(String(html || ''))) && out.length < 8) {
+    try {
+      const parsed = JSON.parse(decodeHtml(m[1]).trim());
+      const list = Array.isArray(parsed) ? parsed : (parsed?.['@graph'] ? parsed['@graph'] : [parsed]);
+      for (const item of list) {
+        const d = item?.description || item?.articleBody || item?.about?.description;
+        const c = cleanAboutCandidate(d || '');
+        if (c) out.push(c);
+      }
+    } catch { /* ignora jsonld ruim */ }
+  }
+  return out;
+}
+
+function extractAboutCompany(html = '', text = '', ticker = '', type = '') {
+  const candidates = [];
+  for (const d of extractJsonLdDescriptions(html)) candidates.push(d);
+  const meta = extractMetaDescription(html);
+  if (meta) candidates.push(meta);
+
+  const section = sectionSlice(text, [
+    'SOBRE A EMPRESA', 'Sobre a empresa', `SOBRE A ${ticker}`, 'SOBRE O FUNDO', 'Sobre o fundo', 'SOBRE A'
+  ], [
+    'DADOS SOBRE A EMPRESA', 'INFORMAÇÕES SOBRE A EMPRESA', 'POSIÇÃO ACIONÁRIA', 'COMUNICADOS', 'Lista de Imóveis', 'Média do Tipo', 'Dividend Yield'
+  ], 5000).text;
+  if (section) candidates.push(section.replace(/^(SOBRE[^\n]*)/i, '').trim());
+
+  for (const c of candidates) {
+    const cleaned = cleanAboutCandidate(c);
+    if (cleaned) return cleaned;
+  }
+  return '';
+}
+
+function safeParseJson(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
+  try { return JSON.parse(s); } catch {}
+  try { return JSON.parse(decodeHtml(s)); } catch {}
+  try { return Function(`"use strict";return (${s});`)(); } catch {}
+  return null;
+}
+
+function extractJsonAssignment(html = '', patterns = []) {
+  const source = String(html || '');
+  for (const pattern of patterns) {
+    const re = typeof pattern === 'string'
+      ? new RegExp(`${escapeRe(pattern)}\\s*=\\s*(\\{[\\s\\S]*?\\}|\\[[\\s\\S]*?\\])\\s*;`, 'i')
+      : pattern;
+    const m = source.match(re);
+    const parsed = safeParseJson(m?.[1]);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function extractBacktickJson(html = '', label = '') {
+  const source = String(html || '');
+  const re = new RegExp(escapeRe(label) + '[\"\']?\\s*:\\s*JSON\\.parse\\(`([^`]+)`\\)', 'gi');
+  const out = [];
+  let m;
+  while ((m = re.exec(source)) && out.length < 20) {
+    const parsed = safeParseJson(m[1]);
+    if (parsed) out.push(parsed);
+  }
+  return out;
+}
+
+function extractRentabilidadeChart(html = '') {
+  const last = extractBacktickJson(html, 'lastProfitability')[0] || null;
+  const profitabilities = extractBacktickJson(html, 'profitabilities');
+  const legends = extractBacktickJson(html, 'legend');
+  if (!last && !profitabilities.length && !legends.length) return null;
+
+  let bestProfitabilities = [];
+  for (const item of profitabilities) {
+    if (Array.isArray(item) && JSON.stringify(item).length > JSON.stringify(bestProfitabilities).length) bestProfitabilities = item;
+  }
+  const legend = legends.find(l => Array.isArray(l) && (!bestProfitabilities.length || l.length === bestProfitabilities.length)) || legends[0] || [];
+  return { lastProfitability: last, legend, profitabilities: bestProfitabilities };
+}
+
+function extractEmbeddedInvestidor10Data(html = '') {
+  const advancedMetrics = extractJsonAssignment(html, [/_sectorIndicators\s*=\s*(\{[\s\S]*?\})\s*;/i, /sectorIndicators\s*=\s*(\{[\s\S]*?\})\s*;/i]);
+  const revenueGeography = extractJsonAssignment(html, [/companyRevenuesChartPie\s*=\s*(\{[\s\S]*?\})\s*;/i]);
+  const revenueSegment = extractJsonAssignment(html, [/companyBussinesRevenuesChartPie\s*=\s*(\{[\s\S]*?\})\s*;/i, /companyBusinessRevenuesChartPie\s*=\s*(\{[\s\S]*?\})\s*;/i]);
+  const rentabilidadeChart = extractRentabilidadeChart(html);
+  const companyId = html.match(/\/api\/balancos\/receitaliquida\/chart\/(\d+)\//)?.[1] ||
+                    html.match(/companyId\s*=\s*['"]?(\d+)['"]?/)?.[1] || '';
+  const tickerId = html.match(/tickerId\s*=\s*['"](\d+)['"]/)?.[1] ||
+                   html.match(/data-ticker-id=["'](\d+)["']/i)?.[1] || '';
+  const fiiId = html.match(/\/api\/fii\/historico-indicadores\/(\d+)\//i)?.[1] ||
+                html.match(/\/api\/fii\/comparador\/table\/(\d+)\//i)?.[1] || '';
+  return { advancedMetrics, revenueGeography, revenueSegment, rentabilidadeChart, companyId, tickerId, fiiId };
+}
+
+async function fetchJsonUrl(url, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': browserHeaders(url)['User-Agent'],
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': 'https://investidor10.com.br/'
+      }
+    });
+    if (!res.ok) return { ok: false, status: res.status, error: `HTTP ${res.status}` };
+    const text = await res.text();
+    const json = safeParseJson(text);
+    if (!json) return { ok: false, status: res.status, error: 'JSON inválido' };
+    return { ok: true, status: res.status, data: json };
+  } catch (err) {
+    return { ok: false, status: 0, error: err?.name === 'AbortError' ? `Timeout ${timeoutMs}ms` : (err?.message || 'Falha de rede') };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function formatIndicatorHistoryValue(rawValue, rawType) {
+  const n = Number(rawValue);
+  if (!Number.isFinite(n)) return stripTags(String(rawValue || '-')) || '-';
+  const type = String(rawType || '').toLowerCase();
+  const dec = (v, d = 2) => v.toLocaleString('pt-BR', { minimumFractionDigits: d, maximumFractionDigits: d });
+  const abbr = (v, d = 2, space = true) => {
+    const abs = Math.abs(v);
+    if (abs >= 1e9) return `${dec(v / 1e9, d)}${space ? ' ' : ''}B`;
+    if (abs >= 1e6) return `${dec(v / 1e6, d)}${space ? ' ' : ''}M`;
+    if (abs >= 1e3) return `${dec(v / 1e3, d)}${space ? ' ' : ''}K`;
+    return dec(v, 0);
+  };
+  if (type === 'money_abbr') return `R$ ${abbr(n, 2, true)}`;
+  if (type === 'number_abbr') return abbr(n, 0, false);
+  if (type === 'money') return `R$ ${dec(n, 2)}`;
+  if (type === 'percent') return `${dec(n, 2)}%`;
+  if (type === 'number') return dec(n, 0);
+  return dec(n, 2);
+}
+
+function normalizeFiiHistoricalIndicatorsApi(data) {
+  if (!data || typeof data !== 'object') return null;
+  const entries = Object.entries(data).filter(([, values]) => Array.isArray(values) && values.length > 0);
+  if (!entries.length) return null;
+  const years = [];
+  for (const [, values] of entries) {
+    for (const item of values) {
+      const y = String(item?.year || '').trim();
+      if (y && !years.includes(y)) years.push(y);
+    }
+  }
+  const colunas = years.length ? years : ['Atual'];
+  const linhas = entries.map(([indicador, values]) => {
+    const byYear = new Map(values.map(item => [String(item?.year || '').trim(), item]));
+    const valores = {};
+    for (const col of colunas) {
+      const item = byYear.get(col);
+      valores[col] = item ? formatIndicatorHistoryValue(item.value, item.type) : '-';
+    }
+    return { indicador, valores };
+  });
+  return { colunas, linhas };
+}
+
+async function fetchInvestidor10ApiExtras(ticker, type, html, options = {}) {
+  if (!ENABLE_INVESTIDOR10_INTERNAL_APIS) return { apiExtras: {}, apiWarnings: [] };
+  const ids = extractEmbeddedInvestidor10Data(html);
+  const apiExtras = { embedded: {}, chartsFinanceiros: {}, apiStatus: [] };
+  const apiWarnings = [];
+  if (ids.advancedMetrics) apiExtras.embedded.advancedMetrics = ids.advancedMetrics;
+  if (ids.revenueGeography) apiExtras.embedded.revenueGeography = ids.revenueGeography;
+  if (ids.revenueSegment) apiExtras.embedded.revenueSegment = ids.revenueSegment;
+  if (ids.rentabilidadeChart) apiExtras.embedded.rentabilidadeChart = ids.rentabilidadeChart;
+
+  const timeoutMs = Number(options.internalApiTimeoutMs || process.env.VALORAE_INTERNAL_API_TIMEOUT_MS || 7000);
+  const base = 'https://investidor10.com.br';
+  const tasks = [];
+  if (type === 'ACAO' && ids.companyId) {
+    tasks.push(['receitasLucros', `${base}/api/balancos/receitaliquida/chart/${ids.companyId}/3650/false/`]);
+    tasks.push(['lucroCotacao', `${base}/api/cotacao-lucro/${ticker.toLowerCase()}/adjusted/`]);
+    tasks.push(['evolucaoPatrimonio', `${base}/api/balancos/ativospassivos/chart/${ids.companyId}/3650/`]);
+    if (ids.tickerId) tasks.push(['payoutHistorico', `${base}/api/acoes/payout-chart/${ids.companyId}/${ids.tickerId}/${ticker.toUpperCase()}/3650`]);
+  }
+  if (type === 'FII' && ids.fiiId) {
+    tasks.push(['historicoIndicadoresFii', `${base}/api/fii/historico-indicadores/${ids.fiiId}/10`]);
+  }
+
+  const responses = await Promise.all(tasks.map(async ([key, url]) => [key, url, await fetchJsonUrl(url, timeoutMs)]));
+  for (const [key, url, r] of responses) {
+    apiExtras.apiStatus.push({ key, url, ok: r.ok, status: r.status, error: r.error });
+    if (!r.ok) continue;
+    if (key === 'historicoIndicadoresFii') apiExtras.historicoIndicadoresFii = normalizeFiiHistoricalIndicatorsApi(r.data);
+    else apiExtras.chartsFinanceiros[key] = r.data;
+  }
+  if (apiExtras.apiStatus.some(x => !x.ok)) apiWarnings.push('Algumas APIs internas do Investidor10 não responderam; o JSON manteve os dados disponíveis no HTML.');
+  return { apiExtras, apiWarnings };
+}
+
+function mergeSectionsDeep(a = {}, b = {}) {
+  const out = { ...(a || {}) };
+  for (const [k, v] of Object.entries(b || {})) {
+    if (v === undefined || v === null) continue;
+    if (Array.isArray(v)) out[k] = Array.isArray(out[k]) && out[k].length ? out[k] : v;
+    else if (typeof v === 'object' && !Array.isArray(v)) out[k] = mergeSectionsDeep(out[k] || {}, v);
+    else if (out[k] === undefined || out[k] === null || out[k] === '') out[k] = v;
+  }
+  return out;
+}
+
+function applyApiExtrasToResults(results, apiExtras = {}, type = '') {
+  const out = { ...results };
+  const sections = { ...(out.sections || {}) };
+  if (apiExtras.embedded) {
+    if (apiExtras.embedded.rentabilidadeChart) sections.rentabilidadeChart = apiExtras.embedded.rentabilidadeChart;
+    if (apiExtras.embedded.advancedMetrics) {
+      out.advancedMetrics = apiExtras.embedded.advancedMetrics;
+      sections.indicadoresAvancados = apiExtras.embedded.advancedMetrics;
+    }
+    if (apiExtras.embedded.revenueGeography) {
+      out.revenueGeography = apiExtras.embedded.revenueGeography;
+      sections.empresa = mergeSectionsDeep(sections.empresa || {}, { regioesReceita: apiExtras.embedded.revenueGeography });
+    }
+    if (apiExtras.embedded.revenueSegment) {
+      out.revenueSegment = apiExtras.embedded.revenueSegment;
+      sections.empresa = mergeSectionsDeep(sections.empresa || {}, { negociosReceita: apiExtras.embedded.revenueSegment });
+    }
+  }
+  if (apiExtras.chartsFinanceiros && Object.keys(apiExtras.chartsFinanceiros).length) {
+    out.chartsFinanceiros = apiExtras.chartsFinanceiros;
+    sections.demonstrativos = mergeSectionsDeep(sections.demonstrativos || {}, apiExtras.chartsFinanceiros);
+  }
+  if (apiExtras.historicoIndicadoresFii) {
+    sections.historicoIndicadores = apiExtras.historicoIndicadoresFii;
+    out.historicoIndicadores = apiExtras.historicoIndicadoresFii;
+  }
+  if (apiExtras.apiStatus) sections.apiStatus = apiExtras.apiStatus;
+  out.sections = sections;
+  return out;
+}
+
+function applyYahooQuoteToResults(results, yahoo) {
+  if (!yahoo?.ok || !yahoo.data) return results;
+  const out = { ...results };
+  if (out.precoAtual !== undefined && out.precoAtual !== yahoo.data.precoAtual) out.precoAtualInvestidor10 = out.precoAtual;
+  if (out.variacaoDay !== undefined && out.variacaoDay !== yahoo.data.variacaoDay) out.variacaoDayInvestidor10 = out.variacaoDay;
+  if (yahoo.data.precoAtual !== undefined) out.precoAtual = yahoo.data.precoAtual;
+  if (yahoo.data.variacaoDay !== undefined) out.variacaoDay = yahoo.data.variacaoDay;
+  out.cotacaoFonte = 'YahooChart';
+  return out;
+}
+
 function processSelectorPairInto(out, titleRaw, valueRaw) {
   const title = stripTags(titleRaw || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
   const value = stripTags(valueRaw || '').replace(/\s+/g, ' ').trim();
@@ -1040,7 +1320,10 @@ function parseSelectorResults(ticker, type, selectorResults = {}) {
 
   const logos = selectorResults.logo || [];
   if (logos[0]) out.logoUrl = String(logos[0]).startsWith('/') ? `https://investidor10.com.br${logos[0]}` : String(logos[0]);
-  const about = (selectorResults.about || []).filter(x => x && String(x).length > 30).slice(0, 5).map(x => stripTags(x).replace(/\s+/g, ' ').trim());
+  const about = (selectorResults.about || [])
+    .map(x => cleanAboutCandidate(x))
+    .filter(Boolean)
+    .slice(0, 3);
   if (about.length) out.sobre = about.join('\n\n');
 
   const propNames = selectorResults.props || [];
@@ -1076,6 +1359,9 @@ function parseInvestidor10Html(ticker, type, html, sourceUrl) {
   const pageTitle = getPageTitle(html);
   if (h1) baseFields.nome = h1;
   else if (pageTitle) baseFields.nome = pageTitle;
+
+  const aboutCompany = extractAboutCompany(html, text, ticker, type);
+  if (aboutCompany) baseFields.sobre = aboutCompany;
 
   const dividendos = extractDividendHistory(compact);
   if (dividendos.length) baseFields.historicoDividendos = dividendos;
@@ -1141,12 +1427,57 @@ function pick(obj, keys) {
 
 
 function mergeParsedResults(primary = {}, secondary = {}) {
-  const merged = { ...primary, ...secondary };
+  // primary = seletores próximos ao DOM; secondary = parser amplo do HTML.
+  // Mantém os campos de maior precisão dos seletores e usa o HTML amplo para completar o resto.
+  const merged = { ...secondary, ...primary };
   if (primary.sections || secondary.sections) {
-    merged.sections = { ...(primary.sections || {}), ...(secondary.sections || {}) };
-    if (primary.sections?.listaImoveis && !secondary.sections?.listaImoveis) merged.sections.listaImoveis = primary.sections.listaImoveis;
+    merged.sections = mergeSectionsDeep(secondary.sections || {}, primary.sections || {});
   }
   return merged;
+}
+
+function buildCoverage(type, results = {}) {
+  const s = results.sections || {};
+  const common = {
+    rentabilidade: !!(s.rentabilidade || s.rentabilidadeChart),
+    historicoIndicadores: !!(s.historicoIndicadores || results.historicoIndicadores),
+    checklistBah: Array.isArray(s.checklistBah) ? s.checklistBah.length > 0 : !!s.checklistBah,
+    dividendos: !!(results.historicoDividendos?.length || s.dividendos?.historico?.length),
+    comunicados: Array.isArray(s.comunicados) ? s.comunicados.length > 0 : !!s.comunicados,
+    graficos: !!(s.rentabilidadeChart || results.chartsFinanceiros || (Array.isArray(s.charts) && s.charts.length > 0)),
+  };
+  if (type === 'FII') {
+    return {
+      ...common,
+      informacoesFundo: !!s.informacoesFundo && Object.keys(s.informacoesFundo).length > 0,
+      comparacaoIndices: !!s.comparacaoIndices,
+      comparacaoFiis: !!s.comparacaoFiis,
+      distribuicoes12m: !!s.distribuicoes12m && Object.keys(s.distribuicoes12m).length > 0,
+      dividendYield: !!(results.dividendYield || s.dividendYieldSecao),
+      sobre: !!results.sobre,
+      listaImoveis: Array.isArray(s.listaImoveis) ? s.listaImoveis.length > 0 : !!s.listaImoveis,
+      valorPatrimonial: !!(s.valorPatrimonial || results.valorPatrimonial || results.valorPatrimonialTotal),
+      mediaTipoSegmento: !!s.mediaTipoSegmento,
+    };
+  }
+  return {
+    ...common,
+    indicadores: ['pl','pvp','dividendYield','roe','roic','payout'].some(k => results[k] !== undefined),
+    radarDividendos: !!s.radarDividendos,
+    comparadorAcoes: !!(s.comparadorAcoes || s.comparador),
+    comparacaoIndices: !!s.comparacaoIndices,
+    comparacaoCommodity: !!s.comparacaoCommodity,
+    sobreEmpresa: !!(results.sobre || s.empresa?.sobre),
+    dadosEmpresa: !!(s.empresa?.dados && Object.keys(s.empresa.dados).length > 0),
+    regioesReceita: !!(s.empresa?.regioesReceita || results.revenueGeography),
+    negociosReceita: !!(s.empresa?.negociosReceita || results.revenueSegment),
+    posicaoAcionaria: !!s.empresa?.posicaoAcionaria,
+    receitasLucros: !!(s.demonstrativos?.receitasLucros || results.chartsFinanceiros?.receitasLucros),
+    lucroCotacao: !!(s.demonstrativos?.lucroCotacao || results.chartsFinanceiros?.lucroCotacao),
+    resultados: !!s.demonstrativos?.resultados,
+    evolucaoPatrimonio: !!(s.demonstrativos?.evolucaoPatrimonio || results.chartsFinanceiros?.evolucaoPatrimonio),
+    balancoPatrimonial: !!s.demonstrativos?.balancoPatrimonial,
+  };
 }
 
 async function fetchYahooChart(ticker) {
@@ -1297,13 +1628,23 @@ export class ValoraeEngine {
     let results = parse?.results || {};
     let source = parse ? (htmlFetch?.hostname?.includes('statusinvest') ? `${htmlFetch?.provider || 'Fetch'}+StatusInvestHTML` : `${htmlFetch?.provider || 'Fetch'}+Investidor10HTML`) : 'None';
 
+    if (parse && htmlFetch?.html && htmlFetch?.hostname?.includes('investidor10')) {
+      const { apiExtras, apiWarnings } = await fetchInvestidor10ApiExtras(ticker, type, htmlFetch.html, options);
+      if (apiExtras && Object.keys(apiExtras).length) {
+        results = applyApiExtrasToResults(results, apiExtras, type);
+        if (apiExtras.apiStatus?.length) source = `${source}+Investidor10InternalAPIs`;
+      }
+      warnings.push(...(apiWarnings || []));
+    }
+
     const hasUseful = Object.keys(results).filter(k => k !== 'sections').length > 0;
-    if (!hasUseful && options.useYahooFallback !== false) {
-      const yahoo = await fetchYahooChart(ticker);
-      if (yahoo.ok) {
-        results = { ...results, ...yahoo.data };
-        source = source === 'None' ? yahoo.source : `${source}+${yahoo.source}`;
-        warnings.push('Retorno parcial: cotação via Yahoo Chart; HTML completo não foi processado.');
+    let yahooQuote = null;
+    if ((USE_YAHOO_FOR_CURRENT_QUOTE || !hasUseful) && options.useYahooFallback !== false) {
+      yahooQuote = await fetchYahooChart(ticker);
+      if (yahooQuote.ok) {
+        results = hasUseful ? applyYahooQuoteToResults(results, yahooQuote) : { ...results, ...yahooQuote.data };
+        source = source === 'None' ? yahooQuote.source : `${source}+${yahooQuote.source}`;
+        if (!hasUseful) warnings.push('Retorno parcial: cotação via Yahoo Chart; HTML completo não foi processado.');
       }
     }
 
@@ -1334,6 +1675,7 @@ export class ValoraeEngine {
       results,
       cacheStatus: parse ? 'LIVE_HTML' : 'ERROR',
       warnings: uniq(warnings),
+      coverage: buildCoverage(type, results),
       news: news?.items,
       newsStatus: includeNews ? { ok: news?.ok, source: news?.source, error: news?.error } : undefined,
       metrics: {
