@@ -2,7 +2,7 @@
 // Motor novo do Valorae Proxy para Vercel/GitHub.
 // Foco: dados públicos de ações/FIIs, diagnóstico claro, sem dados sintéticos.
 
-export const VALORAE_ENGINE_VERSION = '19.7.0-fii-precision';
+export const VALORAE_ENGINE_VERSION = '19.8.0-fii-quality-fix';
 
 const DEFAULT_TIMEOUT_MS = intEnv('VALORAE_FETCH_TIMEOUT_MS', 12000);
 const DEFAULT_MAX_HTML_CHARS = intEnv('VALORAE_MAX_HTML_CHARS', 3_200_000);
@@ -810,7 +810,7 @@ function valueAfterLabelBounded(text, labels, kind = 'number', stopLabels = [], 
 
     if (raw && !/^[-—–]+$/.test(raw)) {
       if (kind === 'percent') return normalizePercent(raw);
-      if (kind === 'string') return raw.replace(/\s+/g, ' ').trim();
+      if (kind === 'string') return cleanFiiTextValue(raw);
       return normalizeNumericString(raw);
     }
   }
@@ -915,11 +915,24 @@ function extractMediaTipoSegmentoStructured(text, ticker = '') {
   };
   const out = {
     pvp: find('P/VP', 'number'),
-    dy12m: find('DY (12M)', 'percent') || find('Dividend Yield', 'percent'),
+    dy12m: find('DY (12M)', 'percent') || find('Dividend Yield', 'percent') || find('DY 12M', 'percent'),
     valorPatrimonial: find('VALOR PATRIMONIAL', 'money'),
-    valorPatrimonialPorCota: find('VAL. PATRIMONIAL P/ COTA', 'money') || find('VALOR PATRIMONIAL POR COTA', 'money'),
+    valorPatrimonialPorCota: find('VAL. PATRIMONIAL P/ COTA', 'money') || find('VALOR PATRIMONIAL POR COTA', 'money') || find('VP/COTA', 'money'),
     rawText: compact.slice(0, 2200),
   };
+  // Fallback para o layout textual que vem como: "GARE11 P/VP : 0,89 Comparação 0,81".
+  const rx = (label, regex, kind) => {
+    if (out[label]) return;
+    const m = compact.match(regex);
+    if (!m) return;
+    const ativoRaw = m[1];
+    const comparacaoRaw = m[2] || '';
+    out[label] = { ativo: parseComparisonValue(ativoRaw, kind), comparacao: parseComparisonValue(comparacaoRaw, kind), ativoRaw, comparacaoRaw };
+  };
+  rx('pvp', new RegExp(`${escapeRe(tickerUpper)}\s+P\/VP\s*:?\s*(\d[\d.,]*)(?:\s+Compara[cç][aã]o\s*(\d[\d.,]*))?`, 'i'), 'number');
+  rx('dy12m', new RegExp(`${escapeRe(tickerUpper)}\s+(?:DY\s*\(12M\)|Dividend Yield)\s*:?\s*([+-]?\d[\d.,]*\s*%)(?:\s+Compara[cç][aã]o\s*([+-]?\d[\d.,]*\s*%))?`, 'i'), 'percent');
+  rx('valorPatrimonial', new RegExp(`${escapeRe(tickerUpper)}\s+VALOR PATRIMONIAL\s*:?\s*((?:R\$)?\s*\d[\d.,]*\s*(?:Bilhões|Bilhão|Milhões|Milhão|[KMB])?)(?:\s+Compara[cç][aã]o\s*((?:R\$)?\s*\d[\d.,]*\s*(?:Bilhões|Bilhão|Milhões|Milhão|[KMB])?))?`, 'i'), 'money');
+  rx('valorPatrimonialPorCota', new RegExp(`${escapeRe(tickerUpper)}\s+VAL\.?\s*PATRIMONIAL\s*P\/?\s*COTA\s*:?\s*((?:R\$)?\s*\d[\d.,]*)(?:\s+Compara[cç][aã]o\s*((?:R\$)?\s*\d[\d.,]*))?`, 'i'), 'money');
   return Object.values(out).some(v => v && typeof v === 'object' && (v.ativo !== undefined || v.comparacao !== undefined)) ? out : { rawText: compact.slice(0, 2200) };
 }
 
@@ -945,7 +958,7 @@ function sanitizeFiiBaseFields(baseFields, text, ticker, genericSections) {
 
   for (const k of ['taxaAdministracao','tipoFundo','segmentoFii','mandato','tipoGestao','prazoDuracao','publicoAlvo']) {
     if (typeof out[k] === 'string') {
-      out[k] = trimAtNextLabel(out[k], FII_STOP_LABELS).slice(0, 160).trim();
+      out[k] = cleanFiiTextValue(trimAtNextLabel(out[k], FII_STOP_LABELS)).slice(0, 160).trim();
       if (!out[k]) delete out[k];
     }
   }
@@ -1245,14 +1258,36 @@ function detectChartKind(text) {
 }
 
 
+function isGenericInvestidor10Logo(url = '') {
+  const u = String(url || '').trim();
+  return !u || /(?:assets\/front\/images\/logo|logo\.webp|favicon|icon)/i.test(u);
+}
+
+function isGenericAboutText(text = '') {
+  const compact = stripTags(text).replace(/\s+/g, ' ').trim();
+  if (!compact) return true;
+  if (/^Tudo sobre finanças, investimentos, ações, indicadores fundamentalistas/i.test(compact)) return true;
+  if (/Preço Justo|Graham|Bazin|Radar de Dividendos|Calculadora|Comparador de/i.test(compact)) return true;
+  if (/Mostra o rendimento|Magic Number|valor patrimonial é um item determinante|Um maior Yield sugere|Fórmula do Magic Number/i.test(compact)) return true;
+  if (/Publicado em|ADICIONAR NA CARTEIRA|Saiba mais/i.test(compact) && compact.length < 500) return true;
+  if (looksLikeNavigationBlock(compact)) return true;
+  return false;
+}
+
 function cleanAboutCandidate(text = '') {
   const compact = stripTags(text).replace(/\s+/g, ' ').trim();
   if (compact.length < 80) return '';
-  if (/Preço Justo|Graham|Bazin|Radar de Dividendos|Calculadora|Comparador de/i.test(compact)) return '';
-  if (/Mostra o rendimento|Magic Number|valor patrimonial é um item determinante|Um maior Yield sugere|Fórmula do Magic Number/i.test(compact)) return '';
-  if (/Publicado em|ADICIONAR NA CARTEIRA|Saiba mais/i.test(compact) && compact.length < 500) return '';
-  if (looksLikeNavigationBlock(compact)) return '';
+  if (isGenericAboutText(compact)) return '';
   return compact.slice(0, 4500);
+}
+
+function cleanFiiTextValue(value = '') {
+  let s = stripTags(value).replace(/\s+/g, ' ').trim();
+  s = s.replace(/^[:;|–—-]+\s*/, '').trim();
+  // Algumas páginas inserem um "O" isolado antes do valor por causa de marcação/ícone do card.
+  s = s.replace(/^O\s+(?=(?:Fundo|H[ií]brid|Ativ|Passiv|Indeterminad|Determinado|Investidor|Cotista|0|R\$|\d))/i, '');
+  s = s.replace(/\s+O\s*$/i, '').trim();
+  return s;
 }
 
 function extractMetaDescription(html = '') {
@@ -1578,7 +1613,10 @@ function parseSelectorResults(ticker, type, selectorResults = {}) {
   for (let i = 0; i < table.length; i += 2) processSelectorPairInto(out, table[i], table[i + 1]);
 
   const logos = selectorResults.logo || [];
-  if (logos[0]) out.logoUrl = String(logos[0]).startsWith('/') ? `https://investidor10.com.br${logos[0]}` : String(logos[0]);
+  if (logos[0]) {
+    const candidateLogo = String(logos[0]).startsWith('/') ? `https://investidor10.com.br${logos[0]}` : String(logos[0]);
+    if (!isGenericInvestidor10Logo(candidateLogo)) out.logoUrl = candidateLogo;
+  }
   const about = (selectorResults.about || [])
     .map(x => cleanAboutCandidate(x))
     .filter(Boolean)
@@ -1642,6 +1680,7 @@ function parseInvestidor10Html(ticker, type, html, sourceUrl) {
     charts: extractChartCandidates(html),
     links: extractLinks(html, sourceUrl).slice(0, 80),
   };
+  if (aboutCompany) sections.sobre = { text: aboutCompany, keyValues: extractPairsFromText(aboutCompany).slice(0, 20), length: aboutCompany.length };
 
   if (type === 'FII') {
     sections.listaImoveis = extractImoveis(text, tables);
@@ -1649,7 +1688,8 @@ function parseInvestidor10Html(ticker, type, html, sourceUrl) {
       'cnpj','numeroCotistas','cotasEmitidas','taxaAdministracao','tipoFundo','segmentoFii','mandato','publicoAlvo','tipoGestao','prazoDuracao','vacanciaFisica','vacanciaFinanceira'
     ]);
     sections.distribuicoes12m = pick(baseFields, ['yield1m','yield3m','yield6m','yield12m','totalDividendos12m','ultimoRendimento']);
-    sections.mediaTipoSegmento = genericSections.mediaTipoSegmento || pick(baseFields, ['pvpMedioTipo','dyMedioTipo']);
+    if (genericSections.mediaTipoSegmento && Object.keys(genericSections.mediaTipoSegmento).length) sections.mediaTipoSegmento = genericSections.mediaTipoSegmento;
+    else { const mediaFallback = pick(baseFields, ['pvpMedioTipo','dyMedioTipo']); if (Object.keys(mediaFallback).length) sections.mediaTipoSegmento = mediaFallback; }
     sections.valorPatrimonial = pick(baseFields, ['valorPatrimonial','valorPatrimonialTotal','patrimonioLiquido','pvp']);
   } else {
     sections.empresa = {
@@ -1688,9 +1728,105 @@ function pick(obj, keys) {
 }
 
 
+function historicalCurrentValue(results = {}, indicadorRe) {
+  const hist = results.sections?.historicoIndicadores || results.historicoIndicadores;
+  const linhas = Array.isArray(hist?.linhas) ? hist.linhas : [];
+  const row = linhas.find(r => indicadorRe.test(String(r?.indicador || '')));
+  if (!row?.valores) return undefined;
+  return row.valores.Atual || row.valores.atual || row.valores['Último'] || row.valores['Ultimo'];
+}
+
+function cleanFiiInfoObject(info = {}) {
+  const out = { ...(info || {}) };
+  for (const key of ['taxaAdministracao','tipoFundo','segmentoFii','mandato','tipoGestao','prazoDuracao','publicoAlvo']) {
+    if (typeof out[key] === 'string') out[key] = cleanFiiTextValue(out[key]);
+  }
+  return out;
+}
+
+function sanitizeFiiSections(results = {}) {
+  const out = { ...results };
+  const sections = { ...(out.sections || {}) };
+
+  // Blocos que aparecem em FIIs por navegação global ou por área de ações/commodities.
+  for (const key of ['radarDividendos','comparadorAcoes','comparador','comparacaoCommodity','dividendYieldSecao']) delete sections[key];
+  if (sections.radarDividendos?.text && looksLikeNavigationBlock(sections.radarDividendos.text)) delete sections.radarDividendos;
+
+  if (sections.informacoesFundo) {
+    sections.informacoesFundo = cleanFiiInfoObject(sections.informacoesFundo);
+    for (const [k, v] of Object.entries(sections.informacoesFundo)) if (out[k] === undefined || out[k] === null || out[k] === '') out[k] = v;
+  }
+
+  if (isGenericInvestidor10Logo(out.logoUrl)) delete out.logoUrl;
+
+  const sectionAbout = typeof sections.sobre === 'string' ? sections.sobre : sections.sobre?.text;
+  const cleanSectionAbout = cleanAboutCandidate(sectionAbout || '');
+  if (cleanSectionAbout) out.sobre = cleanSectionAbout;
+  else if (isGenericAboutText(out.sobre)) delete out.sobre;
+
+  const dy12m = sections.distribuicoes12m?.yield12m || out.yield12m || out.dividendYield;
+  if (dy12m && sections.dividendos) {
+    if (!sections.dividendos.dividendYield || sections.dividendos.dividendYield === '8%') sections.dividendos.dividendYield = dy12m;
+  }
+  if (!out.dividendYield && dy12m) out.dividendYield = dy12m;
+
+  const vpTotalRaw = historicalCurrentValue({ ...out, sections }, /^Valor Patrimonial$/i);
+  const vpCotaRaw = historicalCurrentValue({ ...out, sections }, /Val\. Patrimonial p\/ Cota|Valor Patrimonial.*Cota/i);
+  const pvpRaw = historicalCurrentValue({ ...out, sections }, /^P\/VP$/i);
+  const cotistasRaw = historicalCurrentValue({ ...out, sections }, /Número de Cotistas|Numero de Cotistas/i);
+  const cotasRaw = historicalCurrentValue({ ...out, sections }, /Cotas Emitidas/i);
+
+  sections.valorPatrimonial = { ...(sections.valorPatrimonial || {}) };
+  if (vpTotalRaw) {
+    sections.valorPatrimonial.patrimonioLiquidoRaw = vpTotalRaw;
+    const n = normalizeBRNumber(vpTotalRaw);
+    if (n !== undefined) {
+      sections.valorPatrimonial.patrimonioLiquido = n;
+      sections.valorPatrimonial.valorPatrimonialTotal = n;
+      out.patrimonioLiquido = n;
+      out.valorPatrimonialTotal = n;
+    }
+  }
+  if (vpCotaRaw) {
+    sections.valorPatrimonial.valorPatrimonialRaw = vpCotaRaw;
+    const n = normalizeBRNumber(vpCotaRaw);
+    if (n !== undefined) {
+      sections.valorPatrimonial.valorPatrimonial = n;
+      out.valorPatrimonial = n;
+    }
+  }
+  if (pvpRaw) {
+    const n = normalizeBRNumber(pvpRaw);
+    if (n !== undefined) {
+      sections.valorPatrimonial.pvp = n;
+      out.pvp = n;
+    }
+  }
+  // Mantém o valor exato vindo da seção cadastral; usa histórico só quando não houver número real.
+  if (out.numeroCotistas === undefined && cotistasRaw) {
+    const n = normalizeBRNumber(cotistasRaw);
+    if (n !== undefined) out.numeroCotistas = n;
+  }
+  if (out.cotasEmitidas === undefined && cotasRaw) {
+    const n = normalizeBRNumber(cotasRaw);
+    if (n !== undefined) out.cotasEmitidas = n;
+  }
+
+  out.sections = sections;
+  return out;
+}
+
+function postProcessResultsByType(ticker, type, results = {}) {
+  if (type === 'FII') return sanitizeFiiSections(results);
+  const out = { ...results };
+  if (isGenericInvestidor10Logo(out.logoUrl)) delete out.logoUrl;
+  if (isGenericAboutText(out.sobre)) delete out.sobre;
+  return out;
+}
+
 function mergeParsedResults(primary = {}, secondary = {}) {
   // primary = seletores retornados pelo ValoraeScrape; secondary = parser amplo + parser específico por seção.
-  // Na v19.7 o parser específico do HTML tem prioridade para evitar campos de FII poluídos por checklist/menu.
+  // Na v19.8 o parser específico do HTML tem prioridade para evitar campos de FII poluídos por checklist/menu.
   const merged = { ...primary, ...secondary };
   if (primary.sections || secondary.sections) {
     merged.sections = mergeSectionsDeep(primary.sections || {}, secondary.sections || {});
@@ -1909,6 +2045,8 @@ export class ValoraeEngine {
         if (!hasUseful) warnings.push('Retorno parcial: cotação via Yahoo Chart; HTML completo não foi processado.');
       }
     }
+
+    results = postProcessResultsByType(ticker, type, results);
 
     if (!parse) {
       const blocked = sourcesTried.find(s => s.blocked || s.status === 403 || s.status === 401 || s.status === 429);
