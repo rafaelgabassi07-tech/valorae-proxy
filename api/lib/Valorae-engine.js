@@ -2,7 +2,7 @@
 // Motor novo do Valorae Proxy para Vercel/GitHub.
 // Foco: dados públicos de ações/FIIs, diagnóstico claro, sem dados sintéticos.
 
-export const VALORAE_ENGINE_VERSION = '19.8.0-fii-quality-fix';
+export const VALORAE_ENGINE_VERSION = '19.9.0-json-quality-fix';
 
 const DEFAULT_TIMEOUT_MS = intEnv('VALORAE_FETCH_TIMEOUT_MS', 12000);
 const DEFAULT_MAX_HTML_CHARS = intEnv('VALORAE_MAX_HTML_CHARS', 3_200_000);
@@ -1764,15 +1764,22 @@ function sanitizeFiiSections(results = {}) {
   if (cleanSectionAbout) out.sobre = cleanSectionAbout;
   else if (isGenericAboutText(out.sobre)) delete out.sobre;
 
-  const dy12m = sections.distribuicoes12m?.yield12m || out.yield12m || out.dividendYield;
+  if (out.dividendos && !sections.dividendos) sections.dividendos = out.dividendos;
+
+  const dy12m = sections.distribuicoes12m?.yield12m || out.yield12m || historicalCurrentValue({ ...out, sections }, /^Dividend Yield$/i) || out.dividendYield;
   if (dy12m && sections.dividendos) {
-    if (!sections.dividendos.dividendYield || sections.dividendos.dividendYield === '8%') sections.dividendos.dividendYield = dy12m;
+    if (!sections.dividendos.dividendYield || sections.dividendos.dividendYield === '8%' || /^8,?00?%?$/.test(String(sections.dividendos.dividendYield))) {
+      sections.dividendos.dividendYield = dy12m;
+    }
+    out.dividendos = sections.dividendos;
   }
-  if (!out.dividendYield && dy12m) out.dividendYield = dy12m;
+  if ((!out.dividendYield || out.dividendYield === '8%' || /^8,?00?%?$/.test(String(out.dividendYield))) && dy12m) out.dividendYield = dy12m;
 
   const vpTotalRaw = historicalCurrentValue({ ...out, sections }, /^Valor Patrimonial$/i);
   const vpCotaRaw = historicalCurrentValue({ ...out, sections }, /Val\. Patrimonial p\/ Cota|Valor Patrimonial.*Cota/i);
   const pvpRaw = historicalCurrentValue({ ...out, sections }, /^P\/VP$/i);
+  const valorMercadoRaw = historicalCurrentValue({ ...out, sections }, /^Valor de Mercado$/i);
+  const liquidezRaw = historicalCurrentValue({ ...out, sections }, /Liquidez Diária|Liquidez Media Diaria|Liquidez Média Diária/i);
   const cotistasRaw = historicalCurrentValue({ ...out, sections }, /Número de Cotistas|Numero de Cotistas/i);
   const cotasRaw = historicalCurrentValue({ ...out, sections }, /Cotas Emitidas/i);
 
@@ -1802,6 +1809,18 @@ function sanitizeFiiSections(results = {}) {
       out.pvp = n;
     }
   }
+  if (valorMercadoRaw) {
+    const n = normalizeBRNumber(valorMercadoRaw);
+    if (n !== undefined) {
+      out.valorDeMercado = n;
+      sections.valorPatrimonial.valorDeMercado = n;
+      sections.valorPatrimonial.valorDeMercadoRaw = valorMercadoRaw;
+    }
+  }
+  if (liquidezRaw) {
+    const n = normalizeBRNumber(liquidezRaw);
+    if (n !== undefined) out.liquidezDiaria = n;
+  }
   // Mantém o valor exato vindo da seção cadastral; usa histórico só quando não houver número real.
   if (out.numeroCotistas === undefined && cotistasRaw) {
     const n = normalizeBRNumber(cotistasRaw);
@@ -1816,17 +1835,69 @@ function sanitizeFiiSections(results = {}) {
   return out;
 }
 
+function sanitizeAcaoResults(results = {}) {
+  const out = { ...results };
+  const sem = out.indicadoresFundamentalistas?.semComparativos;
+  if (sem && typeof sem === 'object') {
+    // O parser amplo pode pegar valores de cards vizinhos; o bloco estruturado de indicadores tem prioridade.
+    const keys = [
+      'pl','pvp','psr','dividendYield','payout','margemLiquida','margemBruta','margemEbit','margemEbitda',
+      'evEbitda','evEbit','pEbitda','pEbit','pAtivo','pCapGiro','pAtivoCircLiq','vpa','valorPatrimonial','lpa',
+      'giroAtivos','roe','roic','roa','dividaLiquidaPatrimonio','dividaLiquidaEbitda','dividaLiquidaEbit',
+      'dividaBrutaPatrimonio','patrimonioAtivos','passivosAtivos','liquidezCorrente','cagrReceitas5a','cagrLucros5a'
+    ];
+    for (const key of keys) {
+      const semKey = key === 'dividendYield' ? 'dy' : key;
+      if (sem[semKey] !== undefined) out[key] = sem[semKey];
+    }
+    if (sem.dy !== undefined) out.dividendYield = sem.dy;
+    if (sem.vpa !== undefined) out.valorPatrimonial = sem.vpa;
+  }
+
+  if (out.dadosEmpresa?.cnpj && !out.cnpj) out.cnpj = out.dadosEmpresa.cnpj;
+  if (out.informacoesEmpresa && typeof out.informacoesEmpresa === 'object') {
+    for (const key of ['valorDeMercado','valorDeFirma','patrimonioLiquido','freeFloat','tagAlong','liquidezMediaDiaria']) {
+      if (out.informacoesEmpresa[key] !== undefined) out[key] = out.informacoesEmpresa[key];
+    }
+    if (out.informacoesEmpresa.liquidezMediaDiaria !== undefined) out.liquidezDiaria = out.informacoesEmpresa.liquidezMediaDiaria;
+  }
+
+  if (out.dividendos?.historico?.length && !out.historicoDividendos?.length) out.historicoDividendos = out.dividendos.historico;
+  if (out.dividendos?.dividendYield) out.dividendYield = out.dividendos.dividendYield;
+  if (out.dividendos?.dyMedio5a) out.dyMedio5a = out.dividendos.dyMedio5a;
+
+  const sections = { ...(out.sections || {}) };
+  if (out.indicadoresFundamentalistas) sections.indicadores = out.indicadoresFundamentalistas;
+  if (out.rentabilidade) sections.rentabilidade = out.rentabilidade;
+  if (out.rentabilidadeReal) sections.rentabilidadeReal = out.rentabilidadeReal;
+  if (out.checklistBuyAndHold) sections.checklistBah = out.checklistBuyAndHold;
+  if (out.dividendos) sections.dividendos = out.dividendos;
+  if (out.tabelaComparativoPares) sections.comparador = { pares: out.tabelaComparativoPares };
+  if (out.commodities) sections.comparacaoCommodity = out.commodities;
+  if (out.noticias) sections.comunicados = out.noticias;
+  if (out.dadosEmpresa || out.informacoesEmpresa || out.sobre) {
+    sections.empresa = mergeSectionsDeep(sections.empresa || {}, {
+      sobre: isGenericAboutText(out.sobre) ? undefined : out.sobre,
+      dados: out.dadosEmpresa,
+      informacoes: out.informacoesEmpresa,
+    });
+  }
+  if (Object.keys(sections).length) out.sections = sections;
+
+  if (isGenericInvestidor10Logo(out.logoUrl)) delete out.logoUrl;
+  // Para ação, a descrição SEO do ticker ainda é melhor do que texto genérico global; remove só os blocos claramente globais/lixo.
+  if (isGenericAboutText(out.sobre) && !new RegExp(`\b${escapeRe(String(out.nome || ''))}\b|\b${escapeRe(String(out.dadosEmpresa?.nomeCompleto || ''))}\b`, 'i').test(String(out.sobre || ''))) delete out.sobre;
+  return out;
+}
+
 function postProcessResultsByType(ticker, type, results = {}) {
   if (type === 'FII') return sanitizeFiiSections(results);
-  const out = { ...results };
-  if (isGenericInvestidor10Logo(out.logoUrl)) delete out.logoUrl;
-  if (isGenericAboutText(out.sobre)) delete out.sobre;
-  return out;
+  return sanitizeAcaoResults(results);
 }
 
 function mergeParsedResults(primary = {}, secondary = {}) {
   // primary = seletores retornados pelo ValoraeScrape; secondary = parser amplo + parser específico por seção.
-  // Na v19.8 o parser específico do HTML tem prioridade para evitar campos de FII poluídos por checklist/menu.
+  // Na v19.9 o parser específico do HTML tem prioridade para evitar campos de FII poluídos por checklist/menu.
   const merged = { ...primary, ...secondary };
   if (primary.sections || secondary.sections) {
     merged.sections = mergeSectionsDeep(primary.sections || {}, secondary.sections || {});
