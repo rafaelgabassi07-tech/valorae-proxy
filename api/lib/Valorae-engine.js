@@ -2,7 +2,7 @@
 // Motor novo do Valorae Proxy para Vercel/GitHub.
 // Foco: dados públicos de ações/FIIs, diagnóstico claro, sem dados sintéticos.
 
-export const VALORAE_ENGINE_VERSION = '19.6.0-super-parser';
+export const VALORAE_ENGINE_VERSION = '19.7.0-fii-precision';
 
 const DEFAULT_TIMEOUT_MS = intEnv('VALORAE_FETCH_TIMEOUT_MS', 12000);
 const DEFAULT_MAX_HTML_CHARS = intEnv('VALORAE_MAX_HTML_CHARS', 3_200_000);
@@ -756,21 +756,278 @@ function applyFields(text, fields) {
   return out;
 }
 
+function applyFieldsScoped(text, fields, options = {}) {
+  const out = {};
+  const stopLabels = options.stopLabels || fields.flatMap(([, labels]) => labels);
+  for (const [key, labels, kind] of fields) {
+    const value = valueAfterLabelBounded(text, labels, kind, stopLabels);
+    if (value !== undefined && value !== '') out[key] = value;
+  }
+  return out;
+}
+
+const FII_STOP_LABELS = [
+  'CNPJ', 'MANDATO', 'SEGMENTO', 'TIPO DE FUNDO', 'PRAZO DE DURAÇÃO', 'PRAZO DE DURACAO',
+  'TIPO DE GESTÃO', 'TIPO DE GESTAO', 'TAXA DE ADMINISTRAÇÃO', 'TAXA DE ADMINISTRACAO',
+  'VACÂNCIA', 'VACANCIA', 'VACÂNCIA FÍSICA', 'VACANCIA FISICA', 'VACÂNCIA FINANCEIRA',
+  'VACANCIA FINANCEIRA', 'NÚMERO DE COTISTAS', 'NUMERO DE COTISTAS', 'Nº DE COTISTAS',
+  'COTAS EMITIDAS', 'NÚMERO DE COTAS', 'NUMERO DE COTAS', 'PÚBLICO ALVO', 'PUBLICO ALVO',
+  'VALOR PATRIMONIAL', 'VAL. PATRIMONIAL', 'VALOR PATRIMONIAL TOTAL', 'PATRIMÔNIO LÍQUIDO',
+  'PATRIMONIO LIQUIDO', 'LIQUIDEZ DIÁRIA', 'LIQUIDEZ DIARIA', 'ÚLTIMO RENDIMENTO',
+  'ULTIMO RENDIMENTO', 'TOTAL PAGO', 'DIVIDEND YIELD', 'DY', 'P/VP'
+];
+
+function trimAtNextLabel(raw = '', stopLabels = [], currentLabels = []) {
+  const text = String(raw || '').replace(/\s+/g, ' ').trim();
+  const norm = normalizeLoose(text);
+  const current = new Set(currentLabels.map(normalizeLoose));
+  let cut = text.length;
+  for (const label of stopLabels) {
+    const nl = normalizeLoose(label);
+    if (!nl || current.has(nl)) continue;
+    const pos = norm.indexOf(nl, 1);
+    if (pos > 0 && pos < cut) cut = pos;
+  }
+  return text.slice(0, cut).replace(/^[\s:;|–—-]+|[\s:;|–—-]+$/g, '').trim();
+}
+
+function valueAfterLabelBounded(text, labels, kind = 'number', stopLabels = [], window = 260) {
+  const clean = ` ${String(text || '').replace(/\s+/g, ' ')} `;
+  const norm = normalizeLoose(clean);
+  for (const label of labels) {
+    const nl = normalizeLoose(label);
+    const idx = norm.indexOf(nl);
+    if (idx === -1) continue;
+    const rawAfter = clean.slice(Math.max(0, idx + String(label).length), Math.max(0, idx + String(label).length) + window);
+    const chunk = trimAtNextLabel(rawAfter, stopLabels, labels);
+    if (!chunk || /^[-—–]+$/.test(chunk)) continue;
+
+    let raw;
+    if (kind === 'percent') raw = firstMatch(chunk, /([+-]?\d{1,3}(?:[.,]\d{1,4})?\s*%)/);
+    else if (kind === 'money') raw = firstMatch(chunk, /((?:R\$|US\$)?\s*[+-]?\d[\d.]*,?\d*\s*(?:Bilhões|Bilhão|Milhões|Milhão|Trilhões|Trilhão|milhões|milhão|bilhões|bilhão|[KMB])?)/i);
+    else if (kind === 'string') raw = chunk;
+    else raw = firstMatch(chunk, /([+-]?\d[\d.]*,?\d*\s*(?:Bilhões|Bilhão|Milhões|Milhão|Trilhões|Trilhão|milhões|milhão|bilhões|bilhão|[KMB])?)/i);
+
+    if (raw && !/^[-—–]+$/.test(raw)) {
+      if (kind === 'percent') return normalizePercent(raw);
+      if (kind === 'string') return raw.replace(/\s+/g, ' ').trim();
+      return normalizeNumericString(raw);
+    }
+  }
+  return undefined;
+}
+
+function extractFiiInfoSection(text, ticker = '') {
+  const t = canonicalizeTicker(ticker);
+  const headings = [
+    `INFORMAÇÕES SOBRE ${t}`, `Informações sobre ${t}`, 'INFORMAÇÕES SOBRE O FUNDO',
+    'INFORMAÇÕES SOBRE', 'DADOS DO FUNDO', 'Dados do Fundo'
+  ];
+  return sectionSlice(text, headings, [
+    'HISTÓRICO DE INDICADORES', 'COMPARAÇÃO DE', 'COMPARANDO COM OUTROS FIIS',
+    'Checklist do investidor', 'Distribuições nos últimos', 'DIVIDEND YIELD', 'SOBRE A',
+    'Lista de Imóveis', 'COMUNICADOS'
+  ], 6500).text;
+}
+
+function extractFiiPreciseFields(text, ticker = '') {
+  const info = extractFiiInfoSection(text, ticker) || String(text || '').slice(0, 50000);
+  const scoped = info.replace(/\s+/g, ' ').trim();
+  const out = {};
+  const get = (labels, kind, extraStops = []) => valueAfterLabelBounded(scoped, labels, kind, uniq([...FII_STOP_LABELS, ...extraStops]));
+
+  const cnpj = extractCnpj(scoped);
+  if (cnpj) out.cnpj = cnpj;
+
+  const mandato = get(['MANDATO'], 'string');
+  if (mandato) out.mandato = mandato;
+  const segmento = get(['SEGMENTO'], 'string');
+  if (segmento) out.segmentoFii = segmento;
+  const tipoFundo = get(['TIPO DE FUNDO', 'Tipo do Fundo'], 'string');
+  if (tipoFundo) out.tipoFundo = tipoFundo;
+  const prazo = get(['PRAZO DE DURAÇÃO', 'PRAZO DE DURACAO'], 'string');
+  if (prazo) out.prazoDuracao = prazo;
+  const gestao = get(['TIPO DE GESTÃO', 'TIPO DE GESTAO'], 'string');
+  if (gestao) out.tipoGestao = gestao;
+  const taxa = get(['TAXA DE ADMINISTRAÇÃO', 'TAXA DE ADMINISTRACAO'], 'string');
+  if (taxa) out.taxaAdministracao = taxa;
+  const publico = get(['PÚBLICO ALVO', 'PUBLICO ALVO'], 'string');
+  if (publico) out.publicoAlvo = publico;
+
+  const vacFis = get(['VACÂNCIA FÍSICA', 'VACANCIA FISICA'], 'percent');
+  const vacFin = get(['VACÂNCIA FINANCEIRA', 'VACANCIA FINANCEIRA'], 'percent');
+  const vac = get(['VACÂNCIA', 'VACANCIA'], 'percent');
+  if (vacFis) out.vacanciaFisica = vacFis;
+  else if (vac) out.vacanciaFisica = vac;
+  if (vacFin) out.vacanciaFinanceira = vacFin;
+
+  const cotistas = get(['NÚMERO DE COTISTAS', 'NUMERO DE COTISTAS', 'Nº DE COTISTAS'], 'number');
+  if (cotistas !== undefined) out.numeroCotistas = cotistas;
+  const cotas = get(['COTAS EMITIDAS', 'NÚMERO DE COTAS', 'NUMERO DE COTAS'], 'number');
+  if (cotas !== undefined) out.cotasEmitidas = cotas;
+
+  const vpCota = get(['VAL. PATRIMONIAL P/ COTA', 'VALOR PATRIMONIAL POR COTA', 'VP POR COTA'], 'money');
+  if (vpCota !== undefined) out.valorPatrimonial = vpCota;
+  const vpTotal = get(['VALOR PATRIMONIAL TOTAL', 'VAL. PATRIMONIAL TOTAL'], 'money');
+  if (vpTotal !== undefined) {
+    out.valorPatrimonialTotal = vpTotal;
+    out.patrimonioLiquido = vpTotal;
+  }
+
+  out._sourceTextLength = scoped.length;
+  return out;
+}
+
+function parseComparisonValue(raw, kind = 'number') {
+  if (!raw) return undefined;
+  const clean = String(raw).replace(/\s+/g, ' ').trim();
+  if (kind === 'percent') return normalizePercent(clean);
+  if (kind === 'money') return normalizeNumericString(clean);
+  return normalizeNumericString(clean);
+}
+
+function extractMediaTipoSegmentoStructured(text, ticker = '') {
+  const tickerUpper = canonicalizeTicker(ticker);
+  const sec = sectionSlice(text, ['Média do Tipo e Segmento', 'Média do Tipo', 'Média do Segmento'], ['Comentários', 'Últimas notícias', 'COMUNICADOS', 'SOBRE', 'Lista de Imóveis'], 7000).text;
+  if (!sec) return null;
+  const compact = sec.replace(/\s+/g, ' ').trim();
+  const find = (label, kind) => {
+    const idx = normalizeLoose(compact).indexOf(normalizeLoose(label));
+    if (idx === -1) return null;
+    const chunk = compact.slice(idx + label.length, idx + label.length + 220).replace(new RegExp(`^\\s*${escapeRe(tickerUpper)}\\s*`, 'i'), '');
+    const beforeComp = chunk.split(/Comparação|Comparacao/i)[0];
+    const afterComp = chunk.split(/Comparação|Comparacao/i)[1] || '';
+    let ativoRaw;
+    let compRaw;
+    if (kind === 'percent') {
+      ativoRaw = firstMatch(beforeComp, /([+-]?\d[\d.,]*\s*%)/);
+      compRaw = firstMatch(afterComp, /([+-]?\d[\d.,]*\s*%)/);
+    } else if (kind === 'money') {
+      ativoRaw = firstMatch(beforeComp, /((?:R\$)?\s*\d[\d.,]*\s*(?:Bilhões|Bilhão|Milhões|Milhão|milhões|bilhões)?)/i);
+      compRaw = firstMatch(afterComp, /((?:R\$)?\s*\d[\d.,]*\s*(?:Bilhões|Bilhão|Milhões|Milhão|milhões|bilhões)?)/i);
+    } else {
+      ativoRaw = firstMatch(beforeComp, /(\d[\d.,]*)/);
+      compRaw = firstMatch(afterComp, /(\d[\d.,]*)/);
+    }
+    const ativo = parseComparisonValue(ativoRaw, kind);
+    const comparacao = parseComparisonValue(compRaw, kind);
+    return ativo !== undefined || comparacao !== undefined ? { ativo, comparacao, ativoRaw: ativoRaw || '', comparacaoRaw: compRaw || '' } : null;
+  };
+  const out = {
+    pvp: find('P/VP', 'number'),
+    dy12m: find('DY (12M)', 'percent') || find('Dividend Yield', 'percent'),
+    valorPatrimonial: find('VALOR PATRIMONIAL', 'money'),
+    valorPatrimonialPorCota: find('VAL. PATRIMONIAL P/ COTA', 'money') || find('VALOR PATRIMONIAL POR COTA', 'money'),
+    rawText: compact.slice(0, 2200),
+  };
+  return Object.values(out).some(v => v && typeof v === 'object' && (v.ativo !== undefined || v.comparacao !== undefined)) ? out : { rawText: compact.slice(0, 2200) };
+}
+
+function pruneBadSectionSummaries(sections = {}) {
+  for (const key of ['rentabilidade', 'indicadores', 'mediaTipoSegmento']) {
+    const item = sections[key];
+    if (item && typeof item === 'object' && typeof item.text === 'string' && looksLikeNavigationBlock(item.text)) {
+      delete sections[key];
+    }
+  }
+  return sections;
+}
+
+function sanitizeFiiBaseFields(baseFields, text, ticker, genericSections) {
+  const precise = extractFiiPreciseFields(text, ticker);
+  delete precise._sourceTextLength;
+  const out = { ...baseFields, ...precise };
+
+  // Remove valores capturados do checklist em vez da seção cadastral.
+  if (out.numeroCotistas !== undefined && Number(out.numeroCotistas) <= 1000 && precise.numeroCotistas === undefined) delete out.numeroCotistas;
+  if (out.vacanciaFisica === '10%' && precise.vacanciaFisica === undefined) delete out.vacanciaFisica;
+  if (out.vacanciaFinanceira === '10%' && precise.vacanciaFinanceira === undefined) delete out.vacanciaFinanceira;
+
+  for (const k of ['taxaAdministracao','tipoFundo','segmentoFii','mandato','tipoGestao','prazoDuracao','publicoAlvo']) {
+    if (typeof out[k] === 'string') {
+      out[k] = trimAtNextLabel(out[k], FII_STOP_LABELS).slice(0, 160).trim();
+      if (!out[k]) delete out[k];
+    }
+  }
+
+  const media = extractMediaTipoSegmentoStructured(text, ticker);
+  if (media) {
+    if (media.pvp?.ativo !== undefined) out.pvp = media.pvp.ativo;
+    if (media.dy12m?.ativo !== undefined) out.yield12m = media.dy12m.ativo;
+    if (media.valorPatrimonial?.ativo !== undefined) {
+      out.valorPatrimonialTotal = media.valorPatrimonial.ativo;
+      out.patrimonioLiquido = media.valorPatrimonial.ativo;
+    }
+    if (media.valorPatrimonialPorCota?.ativo !== undefined) out.valorPatrimonial = media.valorPatrimonialPorCota.ativo;
+    genericSections.mediaTipoSegmento = media;
+  }
+  return out;
+}
+
+function normalizeLoose(input = '') {
+  return String(input)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9%$.,/()\s-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function looksLikeNavigationBlock(snippet = '') {
+  const n = normalizeLoose(snippet);
+  const hits = [
+    'ativos mais buscados', 'acoes mais buscadas', 'fiis mais buscados',
+    'rankings de acoes', 'rankings de fiis', 'ferramentas gerenciador',
+    'ver todos setores', 'mais buscados petr4', 'mais buscados kncr11',
+    'conversor de criptos', 'renda fixa mais buscadas'
+  ].filter(x => n.includes(x)).length;
+  const manyMenus = (n.match(/mais buscad/g) || []).length >= 3 || (n.match(/ver todos/g) || []).length >= 3;
+  return hits >= 2 || manyMenus;
+}
+
 function sectionSlice(text, headings, nextHeadings = [], maxLen = 7000) {
-  const lower = text.toLowerCase();
-  let start = -1;
-  let used = '';
+  const source = String(text || '');
+  const lower = source.toLowerCase();
+  const candidates = [];
+
   for (const h of headings) {
-    const idx = lower.indexOf(h.toLowerCase());
-    if (idx !== -1 && (start === -1 || idx < start)) { start = idx; used = h; }
+    const needle = h.toLowerCase();
+    let from = 0;
+    while (needle && from < lower.length) {
+      const idx = lower.indexOf(needle, from);
+      if (idx === -1) break;
+      const snippet = source.slice(idx, idx + Math.min(1600, maxLen));
+      let score = idx;
+      if (looksLikeNavigationBlock(snippet)) score += 2_000_000;
+      // Prefer headings that look like actual content blocks, often followed by useful domain words.
+      const useful = normalizeLoose(snippet).match(/dividend|cotista|patrimonial|p\/vp|yield|comunicado|imoveis|balanco|receita|lucro|checklist|vacancia|comparacao/);
+      if (useful) score -= 10_000;
+      candidates.push({ idx, heading: h, score });
+      from = idx + needle.length;
+    }
   }
-  if (start === -1) return { heading: '', text: '' };
-  let end = Math.min(text.length, start + maxLen);
-  for (const h of nextHeadings) {
-    const idx = lower.indexOf(h.toLowerCase(), start + used.length + 20);
-    if (idx !== -1 && idx < end) end = idx;
+
+  if (!candidates.length) return { heading: '', text: '' };
+  candidates.sort((a, b) => a.score - b.score || a.idx - b.idx);
+  const { idx: start, heading: used } = candidates[0];
+
+  let end = Math.min(source.length, start + maxLen);
+  const defaultNext = [
+    'Histórico de Dividendos', 'RADAR DE DIVIDENDOS', 'COMPARADOR', 'COMPARAÇÃO',
+    'SOBRE A EMPRESA', 'SOBRE O FUNDO', 'DADOS SOBRE', 'INFORMAÇÕES SOBRE',
+    'Regiões onde', 'Negócios que', 'POSIÇÃO ACIONÁRIA', 'Receitas e Lucros',
+    'LUCRO X COTAÇÃO', 'Resultados', 'EVOLUÇÃO DO PATRIMÔNIO', 'BALANÇO PATRIMONIAL',
+    'COMUNICADOS', 'Lista de Imóveis', 'Distribuições nos últimos', 'DIVIDEND YIELD',
+    'Média do Tipo', 'Média do Segmento', 'Comentários', 'Últimas notícias'
+  ];
+  const stops = uniq([...(nextHeadings || []), ...defaultNext]).filter(h => normalizeLoose(h) !== normalizeLoose(used));
+  for (const h of stops) {
+    const needle = h.toLowerCase();
+    const found = lower.indexOf(needle, start + used.length + 20);
+    if (found !== -1 && found < end) end = found;
   }
-  return { heading: used, text: text.slice(start, end).trim() };
+  return { heading: used, text: source.slice(start, end).trim() };
 }
 
 function extractDividendHistory(text) {
@@ -992,7 +1249,9 @@ function cleanAboutCandidate(text = '') {
   const compact = stripTags(text).replace(/\s+/g, ' ').trim();
   if (compact.length < 80) return '';
   if (/Preço Justo|Graham|Bazin|Radar de Dividendos|Calculadora|Comparador de/i.test(compact)) return '';
+  if (/Mostra o rendimento|Magic Number|valor patrimonial é um item determinante|Um maior Yield sugere|Fórmula do Magic Number/i.test(compact)) return '';
   if (/Publicado em|ADICIONAR NA CARTEIRA|Saiba mais/i.test(compact) && compact.length < 500) return '';
+  if (looksLikeNavigationBlock(compact)) return '';
   return compact.slice(0, 4500);
 }
 
@@ -1352,9 +1611,11 @@ function parseInvestidor10Html(ticker, type, html, sourceUrl) {
   const text = stripTags(html);
   const compact = text.replace(/\s+/g, ' ').trim();
   const tables = parseHtmlTables(html);
-  const baseFields = type === 'FII' ? applyFields(compact, FII_FIELDS) : applyFields(compact, ACAO_FIELDS);
+  let baseFields = type === 'FII' ? applyFields(compact, FII_FIELDS) : applyFields(compact, ACAO_FIELDS);
+  const genericSections = pruneBadSectionSummaries(extractGenericSectionData(text, tables));
+  if (type === 'FII') baseFields = sanitizeFiiBaseFields(baseFields, text, ticker, genericSections);
   const cnpj = extractCnpj(compact);
-  if (cnpj) baseFields.cnpj = cnpj;
+  if (cnpj && !baseFields.cnpj) baseFields.cnpj = cnpj;
   const h1 = getH1(html);
   const pageTitle = getPageTitle(html);
   if (h1) baseFields.nome = h1;
@@ -1362,11 +1623,11 @@ function parseInvestidor10Html(ticker, type, html, sourceUrl) {
 
   const aboutCompany = extractAboutCompany(html, text, ticker, type);
   if (aboutCompany) baseFields.sobre = aboutCompany;
+  else if (baseFields.sobre && cleanAboutCandidate(baseFields.sobre) === '') delete baseFields.sobre;
 
   const dividendos = extractDividendHistory(compact);
   if (dividendos.length) baseFields.historicoDividendos = dividendos;
 
-  const genericSections = extractGenericSectionData(text, tables);
   const sections = {
     ...genericSections,
     checklistBah: extractChecklist(text),
@@ -1389,6 +1650,7 @@ function parseInvestidor10Html(ticker, type, html, sourceUrl) {
     ]);
     sections.distribuicoes12m = pick(baseFields, ['yield1m','yield3m','yield6m','yield12m','totalDividendos12m','ultimoRendimento']);
     sections.mediaTipoSegmento = genericSections.mediaTipoSegmento || pick(baseFields, ['pvpMedioTipo','dyMedioTipo']);
+    sections.valorPatrimonial = pick(baseFields, ['valorPatrimonial','valorPatrimonialTotal','patrimonioLiquido','pvp']);
   } else {
     sections.empresa = {
       sobre: genericSections.sobre || null,
@@ -1427,11 +1689,11 @@ function pick(obj, keys) {
 
 
 function mergeParsedResults(primary = {}, secondary = {}) {
-  // primary = seletores próximos ao DOM; secondary = parser amplo do HTML.
-  // Mantém os campos de maior precisão dos seletores e usa o HTML amplo para completar o resto.
-  const merged = { ...secondary, ...primary };
+  // primary = seletores retornados pelo ValoraeScrape; secondary = parser amplo + parser específico por seção.
+  // Na v19.7 o parser específico do HTML tem prioridade para evitar campos de FII poluídos por checklist/menu.
+  const merged = { ...primary, ...secondary };
   if (primary.sections || secondary.sections) {
-    merged.sections = mergeSectionsDeep(secondary.sections || {}, primary.sections || {});
+    merged.sections = mergeSectionsDeep(primary.sections || {}, secondary.sections || {});
   }
   return merged;
 }
