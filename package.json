@@ -1,7 +1,7 @@
 {
   "name": "nexus-proxy",
-  "version": "1.8.4",
-  "description": "Proxy serverless para scraping B3 (Investidor10 / StatusInvest / Google News) compatível com Vercel",
+  "version": "1.8.6-waf-fix",
+  "description": "Proxy serverless para scraping B3 (Investidor10 / StatusInvest / Google News) compatível com Vercel - WAF/unhandled rejection fix",
   "private": true,
   "type": "module",
   "scripts": {
