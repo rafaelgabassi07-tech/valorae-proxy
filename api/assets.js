@@ -1,86 +1,67 @@
-import { NexusEngineUltra, inferAssetType, canonicalizeTicker, validarTicker } from './lib/nexus-engine.js';
+import { NexusEngineUltra, inferAssetType, canonicalizeTicker, validarTicker } from '../lib/nexus-engine.js';
+import { configureEngineForRequest, numberEnv, sendMethodNotAllowed, setCors, truthy } from '../lib/vercel-runtime.js';
 
-// Limite de tickers por requisição — protege contra abuso e timeout do Vercel
-const MAX_TICKERS = 20;
+// Protege contra abuso e contra fan-out excessivo no Vercel.
+const MAX_TICKERS = numberEnv('MAX_TICKERS_PER_REQUEST', 20, { min: 1, max: 50 });
 
 export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  setCors(res, 'GET, POST, OPTIONS');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
+  configureEngineForRequest(NexusEngineUltra, req);
 
-  // Aceita tickers via GET ?tickers=PETR4,VISC11,BOVA11
-  // ou via POST { "tickers": ["PETR4", "VISC11", "BOVA11"] }
   let rawTickers = [];
+  const input = req.method === 'GET' ? req.query : (req.body || {});
 
   if (req.method === 'GET') {
-    const param = req.query.tickers || req.query.ticker || '';
-    rawTickers = param.split(',').map(t => t.trim()).filter(Boolean);
+    const param = input.tickers || input.ticker || '';
+    rawTickers = String(param).split(',').map(t => t.trim()).filter(Boolean);
   } else if (req.method === 'POST') {
-    const body = req.body;
-    if (Array.isArray(body?.tickers)) {
-      rawTickers = body.tickers;
-    } else if (typeof body?.tickers === 'string') {
-      rawTickers = body.tickers.split(',').map(t => t.trim()).filter(Boolean);
-    }
+    if (Array.isArray(input?.tickers)) rawTickers = input.tickers;
+    else if (typeof input?.tickers === 'string') rawTickers = input.tickers.split(',').map(t => t.trim()).filter(Boolean);
   } else {
-    return res.status(405).json({ error: 'Método não permitido. Use GET ou POST.' });
+    return sendMethodNotAllowed(res, 'GET, POST, OPTIONS');
   }
+
+  rawTickers = [...new Set(rawTickers.map(t => String(t).trim()).filter(Boolean))];
 
   if (rawTickers.length === 0) {
     return res.status(400).json({
       error: 'Envie ao menos um ticker.',
-      hint: 'GET /api/assets?tickers=PETR4,VISC11  ou  POST { "tickers": ["PETR4","VISC11"] }',
+      hint: 'GET /api/assets?tickers=PETR4,VISC11 ou POST {"tickers":["PETR4","VISC11"]}',
     });
   }
 
   if (rawTickers.length > MAX_TICKERS) {
-    return res.status(400).json({
-      error: `Máximo de ${MAX_TICKERS} tickers por requisição. Enviados: ${rawTickers.length}.`,
-    });
+    return res.status(400).json({ error: `Máximo de ${MAX_TICKERS} tickers por requisição. Enviados: ${rawTickers.length}.` });
   }
 
-  // Valida e normaliza todos os tickers antes de qualquer fetch
-  const valid   = [];
-  const invalid = [];
+  const valid = [];
+  const errors = [];
 
   for (const raw of rawTickers) {
     const clean = canonicalizeTicker(raw);
-    const erro  = validarTicker(clean);
-    if (erro) {
-      invalid.push({ ticker: raw, error: erro });
-    } else {
-      valid.push(clean);
-    }
+    const erro = validarTicker(clean);
+    if (erro) errors.push({ ticker: raw, error: erro });
+    else valid.push({ ticker: clean, type: input.type ? String(input.type).toUpperCase() : inferAssetType(clean) });
   }
 
-  // Busca todos os tickers válidos em paralelo
-  const results = await Promise.allSettled(
-    valid.map(async (ticker) => {
-      const type   = inferAssetType(ticker);
-      const result = await NexusEngineUltra.fetchAtivo(ticker, type);
-      return result;
-    })
-  );
+  const mode = String(input.mode || '').toLowerCase();
+  const includeNews = truthy(input.includeNews) || truthy(input.news) || mode === 'full' || mode === 'super';
 
-  // Monta resposta separando sucesso de falha
-  const assets  = [];
-  const errors  = [...invalid];
+  try {
+    // Usa o batch real do engine, que limita concorrência e aproveita /api/batch-scrape quando configurado.
+    const batch = await NexusEngineUltra.fetchAtivosBatch(valid, includeNews);
+    const assets = [];
 
-  results.forEach((outcome, i) => {
-    if (outcome.status === 'fulfilled') {
-      assets.push(outcome.value);
-    } else {
-      errors.push({ ticker: valid[i], error: outcome.reason?.message || 'Erro desconhecido' });
-    }
-  });
+    batch.forEach((item, i) => {
+      if (item instanceof Error) errors.push({ ticker: valid[i]?.ticker, error: item.message });
+      else if (item?.error) errors.push({ ticker: item.ticker || valid[i]?.ticker, error: item.error });
+      else assets.push(item);
+    });
 
-  return res.status(200).json({
-    count:   assets.length,
-    assets,
-    errors:  errors.length > 0 ? errors : undefined,
-  });
+    return res.status(200).json({ count: assets.length, assets, errors: errors.length ? errors : undefined });
+  } catch (error) {
+    return res.status(500).json({ error: 'Erro no batch: ' + (error?.message || String(error)), errors });
+  }
 }
-
-

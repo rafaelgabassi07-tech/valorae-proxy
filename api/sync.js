@@ -8,8 +8,9 @@
 
 export default async function handler(req, res) {
   // CORS Configuration
-  res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const corsOrigin = process.env.CORS_ALLOW_ORIGIN || '*';
+  res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+  if (corsOrigin !== '*') res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
   res.setHeader(
     'Access-Control-Allow-Headers',
@@ -34,7 +35,7 @@ export default async function handler(req, res) {
 
   // 1. GET Request: Handles healthcheck / restore
   if (req.method === 'GET') {
-    const { user_id } = req.query;
+    const { user_id } = req.query || {};
 
     if (!user_id) {
       // Act as health check / proxy ping
@@ -82,6 +83,9 @@ export default async function handler(req, res) {
   if (req.method === 'POST') {
     try {
       const payload = req.body;
+      if (!payload || typeof payload !== 'object') {
+        return res.status(400).json({ error: 'Payload JSON inválido ou ausente.' });
+      }
       
       const response = await fetch(`${cleanSupabaseUrl}/rest/v1/valorae_sync_backups`, {
         method: 'POST',
@@ -111,4 +115,3 @@ export default async function handler(req, res) {
 
   return res.status(405).json({ error: `Método ${req.method} não suportado.` });
 }
-
